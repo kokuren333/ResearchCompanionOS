@@ -116,12 +116,15 @@ fn pick_directory() -> Option<String> {
 }
 
 #[tauri::command]
-fn pick_pdf() -> Option<String> {
+fn pick_media() -> Vec<String> {
     rfd::FileDialog::new()
-        .set_title("Choose a research PDF")
-        .add_filter("PDF documents", &["pdf"])
-        .pick_file()
+        .set_title("Choose images or PDF files")
+        .add_filter("Images and PDF", &["pdf", "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "svg"])
+        .pick_files()
+        .unwrap_or_default()
+        .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
+        .collect()
 }
 
 fn kill_backend(app: &tauri::AppHandle) {
@@ -144,7 +147,7 @@ pub fn run() {
             app.manage(BackendPort(Mutex::new(port)));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_backend_port, pick_directory, pick_pdf])
+        .invoke_handler(tauri::generate_handler![get_backend_port, pick_directory, pick_media])
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")
         .run(|app, event| {

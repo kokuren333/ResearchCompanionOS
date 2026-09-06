@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import ResearchStore
-from pypdf import PdfWriter
 
 
 class ResearchCompanionCoreTests(unittest.TestCase):
@@ -248,83 +247,25 @@ class ResearchCompanionCoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.delete_project(remaining["id"])
 
-    def test_pdf_library_extracts_renders_and_deduplicates(self):
+    def test_chat_attachment_is_copied_and_given_to_agent(self):
         source = Path(self.temp.name) / "paper.pdf"
-        writer = PdfWriter()
-        writer.add_blank_page(width=300, height=400)
-        with source.open("wb") as stream:
-            writer.write(stream)
-        vault = Path(self.temp.name) / "paper-vault"
-        self.store.update_settings({"vault_path": str(vault)})
-        imported = self.store.import_pdf({"project_id": self.project["id"], "path": str(source), "discipline": "Test field", "ocr": False})
-        self.assertFalse(imported["duplicate"])
-        document = imported["document"]
-        self.assertEqual(document["page_count"], 1)
-        self.assertTrue(Path(document["stored_path"]).exists())
-        self.assertEqual(len(self.store.pdfs(self.project["id"])), 1)
-        self.assertGreater(len(__import__("pdf_library").render_page(Path(document["stored_path"]), 1)), 100)
-        duplicate = self.store.import_pdf({"project_id": self.project["id"], "path": str(source), "ocr": False})
-        self.assertTrue(duplicate["duplicate"])
-        old_path = Path(document["stored_path"])
-        new_vault = Path(self.temp.name) / "migrated-paper-vault"
-        self.store.update_settings({"vault_path": str(new_vault)})
-        migrated = self.store.pdf(document["id"])
-        self.assertNotEqual(migrated["stored_path"], str(old_path))
-        self.assertTrue(Path(migrated["stored_path"]).exists())
-        self.assertFalse(old_path.exists())
-        self.assertTrue(self.store.delete_pdf(document["id"]))
-        self.assertFalse(Path(migrated["stored_path"]).exists())
-
-    def test_scanned_pdf_ocr_runs_in_background_and_updates_progress(self):
-        source = Path(self.temp.name) / "scanned.pdf"
-        writer = PdfWriter()
-        writer.add_blank_page(width=300, height=400)
-        with source.open("wb") as stream:
-            writer.write(stream)
-        self.store.update_settings({"vault_path": str(Path(self.temp.name) / "ocr-vault")})
-        with patch("app.ocr_page", return_value="Recovered OCR text") as ocr:
-            imported = self.store.import_pdf({"project_id": self.project["id"], "path": str(source), "ocr": True})
-            self.assertTrue(imported["ocr_task_id"])
-            deadline = time.time() + 10
-            document = self.store.pdf(imported["document"]["id"])
-            while document["ocr_status"] in {"pending", "processing"} and time.time() < deadline:
-                time.sleep(.05)
-                document = self.store.pdf(imported["document"]["id"])
-            self.assertEqual(document["ocr_status"], "completed")
-            self.assertEqual(document["ocr_pages_done"], 1)
-            self.assertEqual(document["pages"][0]["text"], "Recovered OCR text")
-            self.assertTrue(ocr.called)
-
-    def test_layout_translation_creates_separate_pdf_without_overwriting_original(self):
-        import fitz
-
-        source = Path(self.temp.name) / "layout-paper.pdf"
-        pdf = fitz.open()
-        page = pdf.new_page(width=300, height=400)
-        page.insert_text((30, 60), "Attention is important", fontsize=12)
-        pdf.save(str(source))
-        pdf.close()
-        vault = Path(self.temp.name) / "layout-vault"
-        self.store.update_settings({"vault_path": str(vault)})
-        imported = self.store.import_pdf({"project_id": self.project["id"], "path": str(source), "discipline": "Layout", "ocr": False})
-        original = Path(imported["document"]["stored_path"])
-        with patch.object(self.store, "_agent_command_with_id", return_value=('[{"id":"p1b0","translation":"重要な注意事項"}]', 0)):
-            started = self.store.start_pdf_translation(imported["document"]["id"])
-            self.assertTrue(started["task_id"])
-            deadline = time.time() + 10
-            document = self.store.pdf(imported["document"]["id"])
-            while document["translation_status"] in {"queued", "processing"} and time.time() < deadline:
-                time.sleep(.05)
-                document = self.store.pdf(imported["document"]["id"])
-        self.assertEqual(document["translation_status"], "completed")
-        translated = Path(document["translated_path"])
-        self.assertTrue(original.exists())
-        self.assertTrue(translated.exists())
-        self.assertNotEqual(original, translated)
-        translated_doc = fitz.open(str(translated))
-        self.assertEqual(len(translated_doc), 1)
-        translated_doc.close()
-
+        source.write_bytes(b"%PDF-1.7 test payload")
+        with patch.object(self.store, "_agent_command_with_id", return_value=("PDF summary", 0)) as agent:
+            result = self.store.chat({
+                "project_id": self.project["id"],
+                "message": "/summarize",
+                "attachments": [{"name": source.name, "path": str(source), "mime_type": "application/pdf"}],
+                "urls": ["https://example.com/research"],
+            })
+        prompt = agent.call_args.args[1]
+        self.assertIn("ATTACHED MEDIA", prompt)
+        self.assertIn("paper.pdf", prompt)
+        self.assertIn("https://example.com/research", prompt)
+        conversation = self.store.conversation(result["conversation_id"])
+        metadata = conversation["messages"][0]["metadata"]
+        self.assertEqual(metadata["attachments"][0]["name"], "paper.pdf")
+        self.assertTrue(Path(metadata["attachments"][0]["path"]).is_file())
+        self.assertIn("PDF summary", result["message"]["content"])
 
 if __name__ == "__main__":
     unittest.main()

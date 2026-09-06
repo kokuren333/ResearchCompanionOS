@@ -2,7 +2,7 @@
 
 [日本語版 / Japanese](README.ja.md) · [Project overview](README.md)
 
-Research Companion OS is a local-first research continuity tool. Its normal interface is a ChatGPT-style chat. The app keeps durable research state and structured memories in SQLite, compiles a small context packet for an agent, and projects the resulting knowledge into a navigable Obsidian vault. Research PDFs can be stored by discipline and exported as separate layout-preserving Japanese PDFs.
+Research Companion OS is a local-first research continuity tool. Its normal interface is a ChatGPT-style chat. The app keeps durable research state and structured memories in SQLite, compiles a small context packet for an agent, and projects the resulting knowledge into a navigable Obsidian vault. Chat messages can include images, PDFs, and URLs; the configured agent receives the local file paths and URL list.
 
 ## Why it exists
 
@@ -21,7 +21,7 @@ SQLite is the source of truth. Obsidian is a readable projection and an optional
 
 Unzip the release and launch `Research Companion.exe`. The Python backend is bundled inside the Tauri application, so Python is not required to run the packaged app. The backend listens only on a dynamically allocated localhost port and the Windows build does not open a console window.
 
-The ZIP is intentionally limited to the executable, documentation, and third-party notices. It does not contain a user Vault, database, credentials, or development checkout.
+The ZIP is intentionally limited to the executable and documentation. It does not contain a user Vault, database, credentials, or development checkout.
 
 ### Run from source
 
@@ -47,7 +47,7 @@ From the repository root:
 .\package-release.ps1
 ```
 
-Tauri installers and the executable are written under `native/src-tauri/target/release/`. The packaging script creates a ZIP under `dist/` and includes only the release executable, documentation, and third-party license notices. `dist/` and all build outputs are ignored by Git.
+Tauri installers and the executable are written under `native/src-tauri/target/release/`. The packaging script creates a ZIP under `dist/` and includes only the release executable and documentation. `dist/` and all build outputs are ignored by Git.
 
 ## The normal workflow
 
@@ -65,13 +65,13 @@ When a command accepts `Title | content`, the part before the first `|` becomes 
 
 ### 3. Review in Research OS
 
-`Research OS` is deliberately separate from Chat. It contains project selection, creation and permanent deletion, Research State editing, Memory CRUD and filtering, hybrid search, state counts, Context Packet preview/copy, graph inspection, maintenance, Obsidian sync, tagged-note import, and a PDF Library.
+`Research OS` is deliberately separate from Chat. It contains project selection, creation and permanent deletion, Research State editing, Memory CRUD and filtering, hybrid search, state counts, Context Packet preview/copy, graph inspection, maintenance, Obsidian sync, and tagged-note import.
 
-### PDF Library
+### 3. Attach media and URLs
 
-Use the PDF Library card to select a PDF and enter a research discipline. The original is stored under the active Vault at `Research Companion/PDF Library/<discipline>/`; an SHA-256 duplicate is not registered twice in the same project. Text PDFs use extracted text. Image-only pages are sent through RapidOCR's small ONNX Runtime CPU model when available, so an NVIDIA GPU is not required.
+Use `＋ 画像/PDF` in the composer to attach PNG, JPEG, GIF, WebP, BMP, TIFF, SVG, or PDF files. Browser uploads are copied into the per-conversation application-data attachment directory. The Tauri build uses its native file picker. The application does not OCR, parse, convert, or rewrite the files; it gives the configured agent the attachment name, MIME type, and absolute local path in the prompt.
 
-Open a paper card and choose `レイアウト翻訳PDFを生成` to create a separate Japanese PDF. The configured local agent (Codex by default) translates detected text blocks, and the local PDF writer removes only those text objects and inserts the translation into the same rectangles. Figures, tables, columns, page dimensions, and formula-like text are retained from the original. The original PDF is never overwritten. Scanned pages use OCR regions when available; uncertain or missing OCR regions remain unchanged. Long translations are reduced to fit the source rectangle, so review the generated PDF. Summarisation still uses the configured agent and is saved as a Finding Memory and Paper note in Obsidian.
+Add a URL in the `URLを追加` field before sending. URLs written directly in the message are also detected. URLs are passed to the agent without being downloaded or interpreted by the application; whether they can be opened depends on the agent's network access and authentication. Attach a PDF and send `/summarize` or `/pdf-summary` to ask the agent for a Japanese research summary with claims, methods, evidence, limitations, and page references when available.
 
 ### 4. Browse the Obsidian projection
 
@@ -89,7 +89,6 @@ Typical structure:
    ├─ Projects/<project>/Memory Index.md
    ├─ Projects/<project>/Memory/<type>/*.md
    ├─ Conversations/*.md
-   └─ Projects/<project>/Papers/<discipline>/*.md
 ```
 
 Home links to projects. A project overview links to its Memory Index and conversations. Memory pages link to their project, related memories, and source conversation. A full sync preserves generated files that a user has edited and writes a separate `Research Companion update` file instead of silently overwriting them.
@@ -110,6 +109,7 @@ Type `/` in the composer. The suggestion list appears immediately with a descrip
 | `/finding` | Save a finding | `/finding The parser rejects Shift-JIS` |
 | `/experiment` | Save an experiment | `/experiment Compare two retrievers` |
 | `/procedure` | Save a reproducible procedure | `/procedure Run the import test` |
+| `/summarize` / `/pdf-summary` | Summarize attached media | Attach a PDF and send `/summarize` |
 | `/objective` | Read or update the project objective | `/objective Build a reliable import path` |
 | `/status` | Show current Research State and counts | `/status` |
 | `/search` | Search the project knowledge base | `/search UTF-8 import` |
@@ -148,11 +148,11 @@ The default path is calculated at runtime from the operating system's per-user a
 - Packaged Tauri app: uses its per-user application-data directory for the database, workspace, and default Vault.
 - Custom locations: set `Vault path` and `Agent working directory` in Settings, or use `--db` for the browser-compatible server.
 
-The application database is authoritative. Vault Markdown files are generated projections marked with a generated-file comment and tracked by `.research-companion-manifest.json`. User-authored notes are imported only when they carry the supported `research-companion` frontmatter/tag conventions. PDF originals are user research assets under the Vault's PDF Library and are not generated Markdown projections.
+The application database is authoritative. Vault Markdown files are generated projections marked with a generated-file comment and tracked by `.research-companion-manifest.json`. User-authored notes are imported only when they carry the supported `research-companion` frontmatter/tag conventions. Chat attachments remain in application data and are not copied into the Vault.
 
 ## Local API
 
-Start `python app.py` and open `http://127.0.0.1:8765`. Core features use the Python standard library; the PDF feature requires the packages in `requirements.txt`. Mutating requests require `X-Research-Companion: desktop`; this prevents an unrelated local web page from invoking the agent runner through CSRF.
+Start `python app.py` and open `http://127.0.0.1:8765`. The backend uses the Python standard library; media files are passed to the agent without a Python media parser. Mutating requests require `X-Research-Companion: desktop`; this prevents an unrelated local web page from invoking the agent runner through CSRF.
 
 ```powershell
 $headers = @{'X-Research-Companion'='desktop'}
@@ -167,7 +167,7 @@ Invoke-RestMethod http://127.0.0.1:8765/api/context/compile -Method Post `
 
 ## Development and tests
 
-The core backend uses the Python standard library; the PDF reader adds the pinned packages in `requirements.txt`. Run:
+The core backend and media handoff use the Python standard library. Run:
 
 ```powershell
 python -m unittest discover -s tests -v

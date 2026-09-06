@@ -2,7 +2,7 @@
 
 [English](README.en.md) · [プロジェクト概要](README.md)
 
-Research Companion OSは、長期研究をローカルで継続するための研究伴走アプリです。普段はChatGPTのようなチャットUIだけを使い、重要な知見をSQLiteへ構造化して保存します。保存した知識は検索やAgent Context Packetに使われ、Obsidianにはプロジェクト・Memory・会話を相互に辿れる形で出力されます。研究PDFは分野別にVaultへ保存し、原PDFを壊さずにレイアウトを維持した日本語PDFを生成できます。
+Research Companion OSは、長期研究をローカルで継続するための研究伴走アプリです。普段はChatGPTのようなチャットUIだけを使い、重要な知見をSQLiteへ構造化して保存します。保存した知識は検索やAgent Context Packetに使われ、Obsidianにはプロジェクト・Memory・会話を相互に辿れる形で出力されます。チャットには画像・PDFを添付でき、URLも指定したエージェントへ渡せます。
 
 ## 目的と考え方
 
@@ -21,7 +21,7 @@ SQLiteが機械側の正本です。Obsidianは人間が読むための投影で
 
 ZIPを展開して `Research Companion.exe` を起動してください。PythonバックエンドはTauriアプリに同梱されているため、配布版の実行にPythonは不要です。バックエンドは動的に割り当てたlocalhostポートだけで待ち受け、Windows版は黒いコマンドプロンプトを開きません。
 
-ZIPには実行ファイルとドキュメント、第三者ライセンス通知だけを含めます。ユーザーのVault、データベース、認証情報、開発用チェックアウトは含めません。
+ZIPには実行ファイルとドキュメントだけを含めます。ユーザーのVault、データベース、認証情報、開発用チェックアウトは含めません。
 
 ### ソースから開発版を起動する
 
@@ -47,7 +47,7 @@ python app.py
 .\package-release.ps1
 ```
 
-Tauriのexeとインストーラーは `native/src-tauri/target/release/` に生成され、配布ZIPは `dist/` に生成されます。`package-release.ps1` がZIPへ入れるのはリリース用exe、ドキュメント、第三者ライセンス通知だけです。`dist/` とビルド生成物はGitで無視されます。
+Tauriのexeとインストーラーは `native/src-tauri/target/release/` に生成され、配布ZIPは `dist/` に生成されます。`package-release.ps1` がZIPへ入れるのはリリース用exeとドキュメントだけです。`dist/` とビルド生成物はGitで無視されます。
 
 ## 基本的な使い方
 
@@ -65,13 +65,15 @@ Tauriのexeとインストーラーは `native/src-tauri/target/release/` に生
 
 ### 3. Research OS管理画面を使う
 
-チャットと分離した管理画面には、プロジェクト選択・作成・完全削除、Research State編集、Memoryの作成・編集・削除・絞り込み、検索、状態別件数、Context Packet確認・コピー、グラフ確認、Maintenance、Obsidian同期、タグ付きノート取り込み、PDF Libraryがあります。
+チャットと分離した管理画面には、プロジェクト選択・作成・完全削除、Research State編集、Memoryの作成・編集・削除・絞り込み、検索、状態別件数、Context Packet確認・コピー、グラフ確認、Maintenance、Obsidian同期、タグ付きノート取り込みがあります。
 
-### PDF Library
+### 3. メディアとURLをエージェントへ渡す
 
-管理画面のPDF LibraryでPDFを選び、研究分野を入力して追加します。PDFは現在のVaultの`Research Companion/PDF Library/<分野>/`へ保存され、同じSHA-256のPDFは同一プロジェクトへ重複登録しません。文字を持つPDFは抽出テキストを使い、画像PDFはRapidOCRの小型ONNX Runtime CPUモデルでOCRを試みます。GPUは必要ありません。
+チャット下部の「＋ 画像/PDF」から、画像（PNG/JPEG/GIF/WebP/BMP/TIFF/SVG）またはPDFを選びます。ブラウザ版ではファイルをアプリデータへコピーし、Tauri版ではネイティブファイル選択から同じ扱いになります。送信時にファイルは会話ごとのローカル添付領域へコピーされ、エージェントのプロンプトにファイル名・MIMEタイプ・絶対パスが付加されます。アプリ自身はOCRやPDF変換を行わず、選択したエージェントにファイルを直接読ませます。
 
-カードを開き「レイアウト翻訳PDFを生成」を押すと、ページ内の文字領域だけを翻訳し、同じ矩形へ日本語を配置した別PDFを作ります。図・表・段組み・ページ寸法は原PDFから引き継ぎ、数式らしい文字領域は原文を保持します。翻訳文の作成は設定済みのローカルエージェント（初期値はCodex）に任せ、PDFの再生成はローカルのレイアウトエンジンが行います。原PDFは上書きしません。画像PDFはCPU OCRの領域情報を使える場合に対応しますが、OCRが不完全な領域は原文のまま残ります。長い日本語は元の矩形内に収まるよう縮小されるため、生成後の目視確認を推奨します。
+URLは「URLを追加」欄に入力してから送信します。本文中に直接書いた`http://`または`https://` URLも自動検出します。URLはダウンロードやアプリ内解析をせず、URL一覧としてエージェントへ渡します。エージェント側のネットワーク権限・認証・ブラウジング機能により読めない場合があります。
+
+PDFを添付して`/summarize`または`/pdf-summary`を送ると、研究課題・方法・主張・根拠・限界・ページ参照を含む日本語要約をエージェントへ依頼できます。要約結果は通常のチャット回答として保存されます。
 
 ### 4. Obsidianで読む
 
@@ -87,7 +89,6 @@ VaultをObsidianで開き、最初に `Research Companion/Home.md` を開いて�
    ├─ Projects/<project>/Memory Index.md
    ├─ Projects/<project>/Memory/<type>/*.md
    ├─ Conversations/*.md
-   └─ Projects/<project>/Papers/<discipline>/*.md
 ```
 
 Homeからプロジェクトへ移動できます。Project OverviewからMemory Indexと会話へ移動でき、Memoryからプロジェクト、関連Memory、元会話へ戻れます。同期時、ユーザーが編集した生成ファイルは上書きせず、隣に`Research Companion update`ファイルを作ります。
@@ -108,6 +109,7 @@ Homeからプロジェクトへ移動できます。Project OverviewからMemory
 | `/finding` | 分かったことを保存 | `/finding parserはShift-JISを拒否する` |
 | `/experiment` | 実験を保存 | `/experiment 2つの検索方式を比較` |
 | `/procedure` | 再現手順を保存 | `/procedure importテストを実行` |
+| `/summarize` / `/pdf-summary` | 添付画像・PDFを要約 | PDFを添付して`/summarize` |
 | `/objective` | 研究目標を確認・更新 | `/objective 安定したimport経路を作る` |
 | `/status` | Research Stateと件数を確認 | `/status` |
 | `/search` | 知識ベースを検索 | `/search UTF-8 import` |
@@ -165,7 +167,7 @@ Invoke-RestMethod http://127.0.0.1:8765/api/context/compile -Method Post `
 
 ## 開発・テスト
 
-バックエンドの基本機能はPython標準ライブラリで動作します。PDF機能には`requirements.txt`のpypdf、pypdfium2、RapidOCR、ONNX Runtime CPUが必要です。ビルドスクリプトが自動インストールし、PyInstallerでバックエンドへ同梱します。
+バックエンドはPython標準ライブラリだけで動作します。添付ファイルは外部ライブラリで解析せず、ローカルへ保存してエージェントへパスで渡します。
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -174,7 +176,7 @@ python -m py_compile app.py
 git diff --check
 ```
 
-ネイティブビルドではPyInstallerでバックエンドをまとめ、Tauriでデスクトップシェルを作ります。`native/node_modules`、PyInstaller作業ファイル、Tauriのtarget、DB、キャッシュ、Vault内容、リリースZIPは無視対象で、コミットしてはいけません。第三者コンポーネントの扱いは`THIRD_PARTY_NOTICES.md`を確認してください。
+ネイティブビルドではPyInstallerでバックエンドをまとめ、Tauriでデスクトップシェルを作ります。`native/node_modules`、PyInstaller作業ファイル、Tauriのtarget、DB、キャッシュ、Vault内容、リリースZIPは無視対象で、コミットしてはいけません。PDF変換・OCRライブラリは配布物にも依存関係にも含めません。
 
 ## 安全性と設計上の境界
 

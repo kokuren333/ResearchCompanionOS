@@ -18,9 +18,7 @@ try {
         python -m pip install pyinstaller
     }
     python -m pip install -r (Join-Path $repoRoot "requirements.txt")
-    $rapidOcrPackage = (python -c "import rapidocr_onnxruntime, pathlib; print(pathlib.Path(rapidocr_onnxruntime.__file__).parent)").Trim()
-    $rapidOcrModels = Join-Path $rapidOcrPackage "models"
-    python -m PyInstaller --noconfirm --clean --onefile --noconsole --name research-companion-backend --hidden-import rapidocr_onnxruntime --hidden-import fitz --collect-all fitz --add-data "$rapidOcrModels;rapidocr_onnxruntime/models" --exclude-module rapidocr.inference_engine.tensorrt --exclude-module torch --exclude-module tensorflow --exclude-module pandas --exclude-module scipy --exclude-module matplotlib --exclude-module sklearn --exclude-module jupyter --distpath $backendDir --workpath $backendWork --specpath $nativeRoot (Join-Path $repoRoot "app.py")
+    python -m PyInstaller --noconfirm --clean --onefile --noconsole --name research-companion-backend --distpath $backendDir --workpath $backendWork --specpath $nativeRoot (Join-Path $repoRoot "app.py")
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE"
     }
