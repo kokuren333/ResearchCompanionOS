@@ -1,5 +1,8 @@
 import tempfile
+import threading
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app import ResearchStore
@@ -51,15 +54,15 @@ class ResearchCompanionCoreTests(unittest.TestCase):
         vault = Path(self.temp.name) / "vault"
         result = self.store.sync_obsidian(str(vault), self.project["id"])
         self.assertGreaterEqual(result["count"], 2)
-        self.assertTrue((vault / "Projects" / "test-research" / "Project State.md").exists())
+        self.assertTrue((vault / "Research Companion" / "Projects" / "test-research" / "Project State.md").exists())
 
     def test_chat_saves_transcript_and_explicit_insight(self):
         vault = Path(self.temp.name) / "shared-vault"
-        self.store.update_settings({"vault_path": str(vault), "workspace_dir": self.temp.name})
+        self.store.update_settings({"vault_path": str(vault), "workspace_dir": self.temp.name, "agent_command": 'python -c "print(\'test-agent\')"'})
         result = self.store.chat({"project_id": self.project["id"], "message": "/remember SQLite should remain the machine source of truth"})
         self.assertEqual(result["memory"]["type"], "note")
         self.assertTrue(Path(result["transcript_path"]).exists())
-        self.assertTrue((vault / "Projects" / "test-research" / "Project State.md").exists())
+        self.assertTrue((vault / "Research Companion" / "Projects" / "test-research" / "Project State.md").exists())
         conversation = self.store.conversation(result["conversation_id"])
         self.assertEqual([m["role"] for m in conversation["messages"]], ["user", "assistant"])
 
@@ -67,6 +70,138 @@ class ResearchCompanionCoreTests(unittest.TestCase):
         output, code = self.store._agent_command('python -c "print(\'agent-ok\')"', 'test prompt', self.temp.name, 30)
         self.assertEqual(code, 0)
         self.assertIn("agent-ok", output)
+
+    def test_agent_stdin_is_utf8(self):
+        command = 'python -c "import sys; print(sys.stdin.buffer.read().hex())"'
+        output, code = self.store._agent_command(command, "こんにちは、研究 companion", self.temp.name, 30)
+        self.assertEqual(code, 0)
+        self.assertIn("e38193e38293e381abe381a1e381afe38081e7a094e7a9b620636f6d70616e696f6e", output)
+
+    def test_default_agent_and_conversation_deletion(self):
+        self.assertEqual(self.store.settings()["agent_command"], "codex exec --skip-git-repo-check --model gpt-5.6-luna -c model_reasoning_effort=low")
+        vault = Path(self.temp.name) / "vault"
+        self.store.update_settings({"vault_path": str(vault), "workspace_dir": self.temp.name, "agent_command": 'python -c "print(\'test-agent\')"'})
+        result = self.store.chat({"project_id": self.project["id"], "message": "/remember delete me"})
+        conversation_id = result["conversation_id"]
+        transcript = Path(result["transcript_path"])
+        self.assertTrue(transcript.exists())
+        self.assertTrue(self.store.delete_conversation(conversation_id))
+        self.assertIsNone(self.store.conversation(conversation_id))
+        self.assertFalse(transcript.exists())
+        self.assertFalse(self.store.delete_conversation(conversation_id))
+
+    def test_full_vault_sync_removes_unchanged_stale_projection(self):
+        vault = Path(self.temp.name) / "manifest-vault"
+        memory = self.store.create_memory({"project_id": self.project["id"], "type": "note", "title": "Old title", "content": "old"})
+        self.store.sync_obsidian(str(vault))
+        old_file = next((vault / "Research Companion" / "Projects" / "test-research" / "Memory" / "note").glob(f"{memory['id']}-*.md"))
+        with self.store.connect() as db:
+            db.execute("UPDATE memories SET title=? WHERE id=?", ("New title", memory["id"]))
+        self.store.sync_obsidian(str(vault))
+        self.assertFalse(old_file.exists())
+        self.assertTrue(any(path.name.startswith(memory["id"] + "-") for path in (vault / "Research Companion" / "Projects" / "test-research" / "Memory" / "note").glob("*.md")))
+
+    def test_imports_only_tagged_user_note(self):
+        vault = Path(self.temp.name) / "import-vault"
+        notes = vault / "Literature"
+        notes.mkdir(parents=True)
+        tagged = notes / "paper.md"
+        tagged.write_text("---\ntags: [research-companion, evidence]\ntype: evidence\n---\n# A tagged paper\n\nObserved result.", encoding="utf-8")
+        (notes / "private.md").write_text("# Private note\n\nDo not import", encoding="utf-8")
+        result = self.store.import_obsidian(str(vault), self.project["id"])
+        self.assertEqual(result["count"], 1)
+        imported = self.store.memory(result["imported"][0])
+        self.assertEqual(imported["type"], "evidence")
+        self.assertEqual(imported["source_type"], "obsidian_note")
+        self.assertEqual(self.store.import_obsidian(str(vault), self.project["id"])["count"], 0)
+
+    def test_daily_job_uses_daily_interval(self):
+        self.store.run_job("daily_research_review")
+        job = next(job for job in self.store.jobs() if job["name"] == "daily_research_review")
+        seconds = datetime.fromisoformat(job["next_run"]).replace(tzinfo=timezone.utc).timestamp() - time.time()
+        self.assertGreater(seconds, 23 * 60 * 60)
+
+    def test_agent_can_be_cancelled(self):
+        result = {}
+        run_id = "run_test_cancel"
+
+        def run_agent():
+            result["value"] = self.store._agent_command_with_id(
+                'python -c "import time; time.sleep(30)"', "test prompt", self.temp.name, 60, run_id
+            )
+
+        worker = threading.Thread(target=run_agent)
+        worker.start()
+        for _ in range(30):
+            if self.store.cancel_agent(run_id):
+                break
+            time.sleep(.1)
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertIn(result["value"][1], (1, 130, -9))
+
+    def test_agent_run_status_keeps_output(self):
+        output, code = self.store._agent_command_with_id(
+            'python -c "print(\'stream-ok\')"', "test prompt", self.temp.name, 30, "run_stream"
+        )
+        status = self.store.run_status("run_stream")
+        self.assertEqual(code, 0)
+        self.assertEqual(status["status"], "finished")
+        self.assertIn("stream-ok", status["output"])
+
+    def test_successful_agent_stderr_is_not_chat_content(self):
+        output, code = self.store._agent_command_with_id(
+            'python -c "import sys; print(\'reply\'); print(\'internal diagnostic\', file=sys.stderr)"',
+            "test prompt", self.temp.name, 30, "run_diagnostics"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "reply")
+
+    def test_legacy_success_message_stderr_is_migrated_away(self):
+        conversation = self.store.create_conversation({"project_id": self.project["id"], "title": "legacy"})
+        with self.store.connect() as db:
+            db.execute(
+                "INSERT INTO chat_messages(id,conversation_id,role,content,metadata_json,created_at) VALUES(?,?,?,?,?,?)",
+                ("legacy_message", conversation["id"], "assistant", "reply\n\n[stderr]\nworkdir: private\ntokens used\n123", '{"exit_code": 0}', "2026-01-01T00:00:00+00:00"),
+            )
+        migrated = ResearchStore(self.store.db_path).conversation(conversation["id"])
+        self.assertEqual(migrated["messages"][0]["content"], "reply")
+
+    def test_slash_commands_update_state_without_running_agent(self):
+        vault = Path(self.temp.name) / "command-vault"
+        self.store.update_settings({"vault_path": str(vault), "workspace_dir": self.temp.name, "agent_command": 'python -c "raise SystemExit(99)"'})
+        result = self.store.chat({"project_id": self.project["id"], "message": "/decision Use a small benchmark | Compare recall@k before changing the embedding model"})
+        self.assertEqual(result["message"]["exit_code"], 0)
+        self.assertEqual(result["memory"]["type"], "decision")
+        self.assertIn("Decisionとして知識ベースに保存しました", result["message"]["content"])
+        self.assertIn("Research State", (vault / "Research Companion" / "Projects" / "test-research" / "Project Overview.md").read_text(encoding="utf-8"))
+
+        objective = self.store.chat({"project_id": self.project["id"], "message": "/objective Validate the retrieval loop"})
+        self.assertEqual(objective["message"]["exit_code"], 0)
+        self.assertEqual(self.store.project(self.project["id"])["current_objective"], "Validate the retrieval loop")
+
+    def test_obsidian_projection_is_navigable_knowledge_base(self):
+        vault = Path(self.temp.name) / "knowledge-vault"
+        first = self.store.create_memory({"project_id": self.project["id"], "type": "decision", "title": "Choose BM25", "content": "Use BM25 as the lexical baseline."})
+        second = self.store.create_memory({"project_id": self.project["id"], "type": "finding", "title": "Baseline is fast", "content": "The baseline is fast enough for local use.", "related_memory_ids": [first["id"]], "relation": "SUPPORTS"})
+        result = self.store.sync_obsidian(str(vault))
+        home = vault / "Research Companion" / "Home.md"
+        overview = vault / "Research Companion" / "Projects" / "test-research" / "Project Overview.md"
+        index = vault / "Research Companion" / "Projects" / "test-research" / "Memory Index.md"
+        second_note = next((vault / "Research Companion" / "Projects" / "test-research" / "Memory" / "finding").glob(f"{second['id']}-*.md"))
+        self.assertGreater(result["count"], 5)
+        self.assertIn("Projects", home.read_text(encoding="utf-8"))
+        self.assertIn("Memory Index", overview.read_text(encoding="utf-8"))
+        self.assertIn("Choose BM25", index.read_text(encoding="utf-8"))
+        self.assertIn("SUPPORTS", second_note.read_text(encoding="utf-8"))
+
+    def test_memory_can_be_updated_and_deleted(self):
+        memory = self.store.create_memory({"project_id": self.project["id"], "type": "note", "title": "Editable", "content": "old"})
+        updated = self.store.update_memory(memory["id"], {"title": "Updated", "content": "new", "state": "HOT"})
+        self.assertEqual(updated["title"], "Updated")
+        self.assertEqual(updated["state"], "HOT")
+        self.assertTrue(self.store.delete_memory(memory["id"]))
+        self.assertIsNone(self.store.memory(memory["id"]))
 
 
 if __name__ == "__main__":

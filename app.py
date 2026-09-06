@@ -15,10 +15,11 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -26,8 +27,29 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-DEFAULT_DB = ROOT / "research_companion.db"
-DEFAULT_VAULT = ROOT / "vault"
+
+
+def default_data_root() -> Path:
+    """Return a per-user data directory without embedding a machine path."""
+    configured = os.getenv("RESEARCH_COMPANION_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if os.name == "nt":
+        base = os.getenv("APPDATA") or os.getenv("LOCALAPPDATA")
+        if base:
+            return (Path(base) / "ResearchCompanion").resolve()
+    if sys.platform == "darwin":
+        return (Path.home() / "Library" / "Application Support" / "ResearchCompanion").resolve()
+    base = os.getenv("XDG_DATA_HOME")
+    return ((Path(base) if base else Path.home() / ".local" / "share") / "research-companion").resolve()
+
+
+DATA_ROOT = default_data_root()
+DEFAULT_DB = DATA_ROOT / "research_companion.db"
+DEFAULT_VAULT = DATA_ROOT / "vault"
+DEFAULT_WORKSPACE = DATA_ROOT
+DEFAULT_AGENT_COMMAND = "codex exec --skip-git-repo-check --model gpt-5.6-luna -c model_reasoning_effort=low"
+LEGACY_DEFAULT_AGENT_COMMAND = "codex exec --model gpt-5.6-luna -c model_reasoning_effort=low"
 NOW = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 MEMORY_TYPES = {
@@ -36,6 +58,18 @@ MEMORY_TYPES = {
     "procedure", "project_narrative", "skill", "researcher_model", "note",
 }
 MEMORY_STATES = {"HOT", "WARM", "COLD", "ARCHIVED"}
+TRUSTED_ORIGINS = {
+    "http://127.0.0.1:8765",
+    "http://localhost:8765",
+    "http://[::1]:8765",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+}
+APP_REQUEST_HEADER = "X-Research-Companion"
+APP_REQUEST_VALUE = "desktop"
+PROJECTION_DIR = "Research Companion"
+VAULT_HOME = "Home.md"
+VAULT_ROOT_GUIDE = "Research Companion.md"
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -95,6 +129,9 @@ class ResearchStore:
     def __init__(self, db_path: str | Path = DEFAULT_DB):
         self.db_path = str(db_path)
         self.lock = threading.RLock()
+        self.process_lock = threading.RLock()
+        self.active_processes: dict[str, subprocess.Popen[bytes]] = {}
+        self.run_states: dict[str, dict[str, Any]] = {}
         self._init_db()
 
     def connect(self) -> sqlite3.Connection:
@@ -173,12 +210,29 @@ class ResearchStore:
         with self.connect() as db:
             defaults = {
                 "vault_path": str(DEFAULT_VAULT),
-                "workspace_dir": str(ROOT),
-                "agent_command": "",
+                "workspace_dir": str(DEFAULT_WORKSPACE),
+                "agent_command": DEFAULT_AGENT_COMMAND,
                 "agent_timeout": "180",
             }
             for key, value in defaults.items():
                 db.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)", (key, value, NOW()))
+            db.execute(
+                "UPDATE settings SET value=?,updated_at=? WHERE key='agent_command' AND value=?",
+                (DEFAULT_AGENT_COMMAND, NOW(), LEGACY_DEFAULT_AGENT_COMMAND),
+            )
+            for row in db.execute("SELECT name,interval_seconds FROM jobs WHERE next_run IS NULL").fetchall():
+                next_run = datetime.now(timezone.utc) + timedelta(seconds=int(row["interval_seconds"]))
+                db.execute("UPDATE jobs SET next_run=? WHERE name=?", (next_run.isoformat(timespec="seconds"), row["name"]))
+            # Older releases appended the agent's stderr stream to successful
+            # assistant messages. Remove that diagnostic tail once, while
+            # leaving user text and genuine failed-agent diagnostics intact.
+            for row in db.execute("SELECT id,content,metadata_json FROM chat_messages WHERE role='assistant' AND content LIKE '%[stderr]%'").fetchall():
+                metadata = json_load(row["metadata_json"], {})
+                if isinstance(metadata, dict) and metadata.get("exit_code", 0) != 0:
+                    continue
+                cleaned = re.split(r"\r?\n\[stderr\]\s*", row["content"], maxsplit=1)[0].rstrip()
+                if cleaned and cleaned != row["content"]:
+                    db.execute("UPDATE chat_messages SET content=? WHERE id=?", (cleaned, row["id"]))
         if not self.projects():
             self.create_project({
                 "name": "Research Companion OS",
@@ -307,6 +361,48 @@ class ResearchStore:
                 rows = db.execute("SELECT * FROM edges ORDER BY strength DESC LIMIT 500").fetchall()
             return [dict(row) for row in rows]
 
+    def update_memory(self, memory_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        allowed = {
+            "project_id", "type", "title", "content", "source_type", "source_id",
+            "confidence", "importance", "novelty", "reuse_probability", "rediscovery_cost",
+            "dependency_count", "activation", "state", "metadata",
+        }
+        sets: list[str] = []
+        values: list[Any] = []
+        for key, value in data.items():
+            if key not in allowed:
+                continue
+            if key == "type" and value not in MEMORY_TYPES:
+                continue
+            if key == "state" and value not in MEMORY_STATES:
+                continue
+            if key == "metadata":
+                value = json.dumps(value if isinstance(value, dict) else {}, ensure_ascii=False)
+            sets.append(f"{key if key != 'metadata' else 'metadata_json'}=?")
+            values.append(value)
+        if not sets:
+            return self.memory(memory_id)
+        sets.append("last_accessed=?")
+        values.extend([NOW(), memory_id])
+        with self.lock, self.connect() as db:
+            exists = db.execute("SELECT 1 FROM memories WHERE id=?", (memory_id,)).fetchone()
+            if not exists:
+                return None
+            db.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id=?", values)
+            self._sync_fts(db, memory_id)
+            db.execute("DELETE FROM memory_embeddings WHERE memory_id=?", (memory_id,))
+            item = db.execute("SELECT title,content FROM memories WHERE id=?", (memory_id,)).fetchone()
+            db.execute("INSERT INTO memory_embeddings(memory_id,vector_json) VALUES(?,?)", (memory_id, json.dumps(vectorize(item["title"] + "\n" + item["content"]))))
+        return self.memory(memory_id)
+
+    def delete_memory(self, memory_id: str) -> bool:
+        with self.lock, self.connect() as db:
+            exists = db.execute("SELECT 1 FROM memories WHERE id=?", (memory_id,)).fetchone()
+            if not exists:
+                return False
+            db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+        return True
+
     def search(self, query: str, project_id: str | None = None, intent: str = "recall", limit: int = 12) -> list[dict[str, Any]]:
         qvec = vectorize(query)
         terms = tokens(query)
@@ -388,7 +484,9 @@ class ResearchStore:
         memories = self.memories(project_id, limit=500)
         counts = {state: sum(1 for m in memories if m["state"] == state) for state in MEMORY_STATES}
         type_counts = {kind: sum(1 for m in memories if m["type"] == kind) for kind in MEMORY_TYPES if any(m["type"] == kind for m in memories)}
-        return {"project": project, "counts": counts, "type_counts": type_counts, "memories": memories[:20], "edges": self.edges()}
+        memory_ids = {m["id"] for m in memories}
+        edges = [edge for edge in self.edges() if edge["source_id"] in memory_ids or edge["target_id"] in memory_ids]
+        return {"project": project, "counts": counts, "type_counts": type_counts, "memories": memories[:20], "edges": edges}
 
     def forget(self) -> dict[str, Any]:
         now = time.time(); changed = []
@@ -431,25 +529,240 @@ class ResearchStore:
             created.append(consolidated["id"])
         return {"clusters": len(clusters), "created": created}
 
+    def _conversation_filename(self, conversation: dict[str, Any]) -> str:
+        return f"{conversation['id']}-{slug(conversation['title'])}.md"
+
     def sync_obsidian(self, vault: str, project_id: str | None = None) -> dict[str, Any]:
+        """Build a navigable, plugin-free Obsidian knowledge base.
+
+        SQLite remains canonical. The generated Vault is deliberately organized
+        around landing pages, project maps, typed memories, and backlinks rather
+        than exposing a flat transcript directory.
+        """
         vault_path = Path(vault).expanduser().resolve()
         vault_path.mkdir(parents=True, exist_ok=True)
+        manifest_path = vault_path / ".research-companion-manifest.json"
+        previous_manifest = json_load(manifest_path.read_text(encoding="utf-8") if manifest_path.is_file() else None, {})
+        previous_files = previous_manifest.get("files", {}) if isinstance(previous_manifest, dict) else {}
         projects = [self.project(project_id)] if project_id else self.projects()
+        all_projects = [p for p in self.projects() if p]
+        all_memories = self.memories(limit=500)
+        all_conversations = [self.conversation(c["id"]) or c for c in self.conversations(limit=200)]
         written: list[str] = []
+        # A project-scoped sync must not delete projections belonging to other
+        # projects. A full sync is the cleanup boundary for the whole Vault.
+        current_files: dict[str, str] = dict(previous_files) if project_id else {}
+
+        def write_projection(path: Path, text: str) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text.rstrip() + "\n", encoding="utf-8")
+            written.append(str(path))
+            current_files[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+        project_paths = {
+            p["id"]: f"{PROJECTION_DIR}/Projects/{slug(p['name'])}/Project Overview"
+            for p in all_projects
+        }
+        memory_paths: dict[str, str] = {}
+        for memory in all_memories:
+            if memory.get("project_id") in project_paths:
+                project_slug = slug(next(p["name"] for p in all_projects if p["id"] == memory["project_id"]))
+                memory_paths[memory["id"]] = f"{PROJECTION_DIR}/Projects/{project_slug}/Memory/{memory['type']}/{memory['id']}-{slug(memory['title'])}"
+        conversation_paths = {
+            c["id"]: f"{PROJECTION_DIR}/Conversations/{self._conversation_filename(c)[:-3]}"
+            for c in all_conversations
+        }
+
+        # A vault landing page explains the generated structure without relying
+        # on Dataview or another Obsidian plugin.
+        home_lines = [
+            "<!-- Generated by Research Companion. Do not edit this file directly. -->",
+            "---", "tags: [research-companion, home]", "type: index", "---",
+            "# Research Companion", "",
+            "このVaultはResearch Companionの研究知識ベースです。SQLiteを正本とし、このフォルダはObsidianで読むための投影です。", "",
+            "## 使い方", "",
+            "- プロジェクトを選び、Project Overviewから研究状態を確認する。",
+            "- MemoryはDecision・Question・Evidenceなどの種類ごとに辿る。",
+            "- 各Memoryの「Knowledge links」から関連知識と元会話へ移動する。",
+            "- アプリの管理画面から検索・編集・同期を行う。", "",
+            "## Projects", "",
+        ]
+        for project in all_projects:
+            project_memories = [m for m in all_memories if m.get("project_id") == project["id"]]
+            home_lines.append(f"- [[{project_paths[project['id']]}|{project['name']}]] — {len(project_memories)} memories / {project['status']}")
+        home_lines += ["", "## Recent conversations", ""]
+        for conversation in all_conversations[:12]:
+            link = conversation_paths[conversation["id"]]
+            home_lines.append(f"- [[{link}|{conversation['title']}]]")
+        home_lines += ["", "## Commands", "", "- `/help` — コマンド一覧", "- `/status` — 現在の研究状態", "- `/search 検索語` — 知識検索", "- `/decision 内容` — Decisionを保存", "- `/question 内容` — Questionを保存", "- `/sync` — Vaultを再生成"]
+        write_projection(vault_path / PROJECTION_DIR / VAULT_HOME, "\n".join(home_lines))
+        write_projection(vault_path / VAULT_ROOT_GUIDE, "<!-- Generated by Research Companion. Do not edit this file directly. -->\n# Research Companion\n\n[[Research Companion/Home|Vault Homeを開く]]")
+
         for project in filter(None, projects):
-            pdir = vault_path / "Projects" / slug(project["name"])
-            (pdir / "Memory").mkdir(parents=True, exist_ok=True)
-            state = ["---", f"id: {project['id']}", f"status: {project['status']}", f"updated_at: {project['updated_at']}", "tags: [research-companion, project]", "---", f"# {project['name']}", "", project.get("description", ""), "", "## Current objective", project.get("current_objective", "(not set)"), "", "## Active questions", *(f"- {x}" for x in project.get("active_questions", [])), "", "## Active hypotheses", *(f"- {x}" for x in project.get("active_hypotheses", [])), "", "## Blockers", *(f"- {x}" for x in project.get("current_blockers", [])), "", "## Next actions", *(f"- {x}" for x in project.get("next_actions", [])), ""]
-            path = pdir / "Project State.md"; path.write_text("\n".join(state), encoding="utf-8"); written.append(str(path))
-            for memory in self.memories(project["id"], limit=500):
-                mdir = pdir / "Memory" / memory["type"]; mdir.mkdir(parents=True, exist_ok=True)
-                content = ["---", f"id: {memory['id']}", f"type: {memory['type']}", f"state: {memory['state']}", f"source_type: {memory['source_type']}", f"confidence: {memory['confidence']:.2f}", f"importance: {memory['importance']:.2f}", f"created_at: {memory['created_at']}", "tags: [research-companion]", "---", f"# {memory['title']}", "", memory["content"], "", f"## Provenance\n- type: {memory['source_type']}\n- id: {memory['source_id'] or '(none)'}"]
-                mp = mdir / f"{memory['id']}-{slug(memory['title'])}.md"; mp.write_text("\n".join(content), encoding="utf-8"); written.append(str(mp))
-        return {"vault": str(vault_path), "written": written, "count": len(written)}
+            pslug = slug(project["name"])
+            pdir = vault_path / PROJECTION_DIR / "Projects" / pslug
+            project_memories = [m for m in all_memories if m.get("project_id") == project["id"]]
+            project_conversations = [c for c in all_conversations if c.get("project_id") == project["id"]]
+            overview_lines = [
+                "<!-- Generated by Research Companion. Do not edit this file directly. -->",
+                "---", f"id: {project['id']}", f"status: {project['status']}", f"updated_at: {project['updated_at']}", "tags: [research-companion, project]", "type: project", "---",
+                f"# {project['name']}", "", project.get("description", ""), "",
+                "## Navigation", "", f"- [[{PROJECTION_DIR}/Home|Vault Home]]", "- [[Memory Index|Memory Index]]", "",
+                "## Research State", "", f"**Status:** {project['status']}", "", f"**Current objective:** {project.get('current_objective') or '(not set)'}", "",
+                "### Active questions", *(f"- {x}" for x in project.get("active_questions", []) or ["(none recorded)"]), "",
+                "### Active hypotheses", *(f"- {x}" for x in project.get("active_hypotheses", []) or ["(none recorded)"]), "",
+                "### Blockers", *(f"- {x}" for x in project.get("current_blockers", []) or ["(none recorded)"]), "",
+                "### Next actions", *(f"- {x}" for x in project.get("next_actions", []) or ["(none recorded)"]), "",
+                "## Knowledge map", "",
+            ]
+            for memory_type in sorted({m["type"] for m in project_memories}):
+                typed = [m for m in project_memories if m["type"] == memory_type]
+                overview_lines.append(f"- [[Memory Index#{memory_type.title()}|{memory_type.title()}]] ({len(typed)})")
+            if not project_memories:
+                overview_lines.append("- まだMemoryがありません。チャットで `/remember` または `/decision` を使ってください。")
+            overview_lines += ["", "## Conversations", ""]
+            for conversation in project_conversations[:20]:
+                overview_lines.append(f"- [[{conversation_paths[conversation['id']]}|{conversation['title']}]]")
+            write_projection(pdir / "Project Overview.md", "\n".join(overview_lines))
+            # Keep the old path as a readable compatibility link for existing
+            # users who bookmarked the original projection.
+            write_projection(pdir / "Project State.md", "<!-- Generated by Research Companion. Do not edit this file directly. -->\n# Project State\n\n[[Project Overview|Open the current project overview]]")
+
+            index_lines = [
+                "<!-- Generated by Research Companion. Do not edit this file directly. -->",
+                "---", f"project_id: {project['id']}", "tags: [research-companion, memory-index]", "type: index", "---",
+                f"# {project['name']} — Memory Index", "", "Project: [[Project Overview]]", "",
+            ]
+            for memory_type in sorted({m["type"] for m in project_memories}):
+                index_lines += [f"## {memory_type.title()}", ""]
+                for memory in [m for m in project_memories if m["type"] == memory_type]:
+                    filename = memory_paths.get(memory["id"], "").rsplit("/", 1)[-1]
+                    index_lines.append(f"- [[Memory/{memory_type}/{filename}|{memory['title']}]] — {memory['state']} · confidence {memory['confidence']:.2f}")
+                index_lines.append("")
+            if not project_memories:
+                index_lines.append("まだMemoryがありません。")
+            write_projection(pdir / "Memory Index.md", "\n".join(index_lines))
+
+            for memory in project_memories:
+                related_links: list[str] = []
+                for edge in self.edges(memory["id"]):
+                    related_id = edge["target_id"] if edge["source_id"] == memory["id"] else edge["source_id"]
+                    if related_id in memory_paths:
+                        related = self.memory(related_id)
+                        related_links.append(f"- [[{memory_paths[related_id]}|{related['title'] if related else related_id}]] — {edge['relation']}")
+                knowledge_links = [f"- Project: [[{project_paths[project['id']]}|{project['name']}]]"]
+                source_conversation = conversation_paths.get(memory.get("source_id")) if memory.get("source_type") in {"chat_message", "slash_command"} else None
+                if source_conversation:
+                    knowledge_links.append(f"- Source conversation: [[{source_conversation}|open conversation]]")
+                if related_links:
+                    knowledge_links += ["", "### Related memories", *related_links]
+                content = [
+                    "<!-- Generated by Research Companion. Do not edit this file directly. -->",
+                    "---", f"id: {memory['id']}", f"type: {memory['type']}", f"state: {memory['state']}", f"source_type: {memory['source_type']}", f"confidence: {memory['confidence']:.2f}", f"importance: {memory['importance']:.2f}", f"created_at: {memory['created_at']}", "tags: [research-companion, memory]", "---",
+                    f"# {memory['title']}", "", memory["content"], "", "## Knowledge links", *knowledge_links,
+                    "", "## Provenance", f"- type: {memory['source_type']}", f"- id: {memory['source_id'] or '(none)'}",
+                ]
+                filename = memory_paths[memory["id"]].rsplit("/", 1)[-1]
+                write_projection(pdir / "Memory" / memory["type"] / f"{filename}.md", "\n".join(content))
+
+        # Transcripts are retained, but they now link back into the knowledge
+        # graph and list any durable memories created from the conversation.
+        for conversation in all_conversations:
+            if project_id and conversation.get("project_id") != project_id:
+                continue
+            lines = [
+                "<!-- Generated by Research Companion. Do not edit this file directly. -->",
+                "---", f"id: {conversation['id']}", f"project_id: {conversation.get('project_id') or ''}", "tags: [research-companion, conversation]", "type: conversation", "---",
+                f"# {conversation['title']}", "", f"- [[{PROJECTION_DIR}/Home|Vault Home]]",
+            ]
+            if conversation.get("project_id") in project_paths:
+                lines.append(f"- [[{project_paths[conversation['project_id']]}|Project Overview]]")
+            conversation_memories = [m for m in all_memories if m.get("source_id") == conversation["id"] and m.get("source_type") in {"chat_message", "slash_command"}]
+            if conversation_memories:
+                lines += ["", "## Durable knowledge", ""]
+                lines.extend(f"- [[{memory_paths[m['id']]}|{m['title']}]]" for m in conversation_memories if m["id"] in memory_paths)
+            lines += ["", "## Transcript", ""]
+            for message in conversation["messages"]:
+                lines += [f"### {message['role'].title()} — {message['created_at']}", "", message["content"], ""]
+            write_projection(vault_path / PROJECTION_DIR / "Conversations" / self._conversation_filename(conversation), "\n".join(lines))
+
+        removed: list[str] = []
+        for old_path, old_hash in previous_files.items():
+            if old_path in current_files:
+                continue
+            candidate = Path(old_path)
+            try:
+                if candidate.is_file() and hashlib.sha256(candidate.read_bytes()).hexdigest() == old_hash:
+                    candidate.unlink(); removed.append(str(candidate))
+            except OSError:
+                continue
+        manifest_path.write_text(json.dumps({"version": 2, "files": current_files}, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"vault": str(vault_path), "written": written, "removed": removed, "count": len(written)}
+
+    def import_obsidian(self, vault: str, project_id: str | None = None) -> dict[str, Any]:
+        """Import only user-authored, explicitly tagged notes from the Vault."""
+        vault_path = Path(vault).expanduser().resolve()
+        if not vault_path.is_dir():
+            return {"vault": str(vault_path), "imported": [], "count": 0}
+        default_project = project_id or (self.projects()[0]["id"] if self.projects() else None)
+        imported: list[str] = []
+        excluded_roots = {PROJECTION_DIR.lower(), "projects", "conversations"}
+        for path in vault_path.rglob("*.md"):
+            try:
+                relative = path.relative_to(vault_path)
+            except ValueError:
+                continue
+            if relative.parts and relative.parts[0].lower() in excluded_roots:
+                continue
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if "research-companion" not in raw.lower():
+                continue
+            frontmatter: dict[str, str] = {}
+            body = raw
+            if raw.startswith("---"):
+                parts = raw.split("---", 2)
+                if len(parts) == 3:
+                    body = parts[2].lstrip("\r\n")
+                    for line in parts[1].splitlines():
+                        if ":" in line:
+                            key, value = line.split(":", 1)
+                            frontmatter[key.strip().lower()] = value.strip().strip("\"'")
+            note_project = frontmatter.get("project_id") or default_project
+            if project_id and note_project != project_id:
+                continue
+            note_type = frontmatter.get("type", "note")
+            if note_type not in MEMORY_TYPES:
+                note_type = "note"
+            heading = next((line[2:].strip() for line in body.splitlines() if line.startswith("# ")), path.stem)
+            source_id = relative.as_posix()
+            with self.connect() as db:
+                exists = db.execute("SELECT 1 FROM memories WHERE source_type='obsidian_note' AND source_id=? LIMIT 1", (source_id,)).fetchone()
+            if exists:
+                continue
+            memory = self.create_memory({
+                "project_id": note_project,
+                "type": note_type,
+                "title": heading[:120] or path.stem,
+                "content": body.strip(),
+                "source_type": "obsidian_note",
+                "source_id": source_id,
+                "confidence": .75,
+            })
+            imported.append(memory["id"])
+        return {"vault": str(vault_path), "imported": imported, "count": len(imported)}
 
     def settings(self) -> dict[str, str]:
         with self.connect() as db:
-            return {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM settings")}
+            settings = {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM settings")}
+        # Existing databases created before the Codex default was introduced
+        # may still contain an empty command. Expose the new default without
+        # overwriting the user's settings row on every server start.
+        if not settings.get("agent_command", "").strip():
+            settings["agent_command"] = DEFAULT_AGENT_COMMAND
+        return settings
 
     def update_settings(self, data: dict[str, Any]) -> dict[str, str]:
         allowed = {"vault_path", "workspace_dir", "agent_command", "agent_timeout"}
@@ -457,7 +770,7 @@ class ResearchStore:
             for key, value in data.items():
                 if key in allowed and value is not None:
                     if key == "vault_path" and not str(value).strip(): value = str(DEFAULT_VAULT)
-                    if key == "workspace_dir" and not str(value).strip(): value = str(ROOT)
+                    if key == "workspace_dir" and not str(value).strip(): value = str(DEFAULT_WORKSPACE)
                     db.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (key, str(value), NOW()))
         current = self.settings()
         Path(current["vault_path"]).expanduser().resolve().mkdir(parents=True, exist_ok=True)
@@ -485,16 +798,97 @@ class ResearchStore:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT c.*, (SELECT content FROM chat_messages m WHERE m.conversation_id=c.id ORDER BY m.created_at DESC LIMIT 1) AS last_message FROM conversations c ORDER BY c.updated_at DESC LIMIT ?", (max(1, min(limit, 200)),))]
 
+    def delete_conversation(self, conversation_id: str) -> bool:
+        conversation = self.conversation(conversation_id)
+        if not conversation:
+            return False
+        with self.lock, self.connect() as db:
+            db.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+        # Conversation markdown is a generated projection, so remove only the
+        # exact file belonging to this conversation when it is in the active vault.
+        try:
+            vault = Path(self.settings()["vault_path"]).expanduser().resolve()
+            for directory in (vault / PROJECTION_DIR / "Conversations", vault / "Conversations"):
+                for transcript in directory.glob(f"{conversation_id}-*.md"):
+                    if transcript.is_file():
+                        transcript.unlink()
+        except OSError:
+            pass
+        return True
+
     def _save_chat_message(self, db: sqlite3.Connection, conversation_id: str, role: str, content: str, metadata: dict[str, Any] | None = None) -> None:
         db.execute("INSERT INTO chat_messages(id,conversation_id,role,content,metadata_json,created_at) VALUES(?,?,?,?,?,?)", (uid("msg"), conversation_id, role, content, json.dumps(metadata or {}, ensure_ascii=False), NOW()))
 
     def _agent_command(self, command: str, prompt: str, cwd: str, timeout: int) -> tuple[str, int]:
+        return self._agent_command_with_id(command, prompt, cwd, timeout, uid("run"))
+
+    def _terminate_process(self, process: subprocess.Popen[bytes]) -> None:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, timeout=5)
+            else:
+                process.kill()
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    def cancel_agent(self, run_id: str) -> bool:
+        with self.process_lock:
+            process = self.active_processes.get(run_id)
+        if not process:
+            return False
+        self._terminate_process(process)
+        return True
+
+    def run_status(self, run_id: str) -> dict[str, Any]:
+        with self.process_lock:
+            state = self.run_states.get(run_id)
+            active = run_id in self.active_processes
+            if not state:
+                return {"run_id": run_id, "status": "not_found", "output": ""}
+            stdout = bytes(state.get("stdout", b""))
+            stderr = bytes(state.get("stderr", b""))
+            return {
+                "run_id": run_id,
+                "status": "running" if active else state.get("status", "finished"),
+                "output": stdout.decode("utf-8", errors="replace"),
+                "stderr": stderr.decode("utf-8", errors="replace"),
+                "exit_code": state.get("exit_code"),
+            }
+
+    def workspace_status(self, cwd: str) -> dict[str, Any]:
+        workdir = Path(cwd).expanduser().resolve()
+        if not workdir.exists() or not workdir.is_dir():
+            return {"path": str(workdir), "is_git": False, "error": "作業ディレクトリが存在しません"}
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(workdir), "status", "--short"],
+                capture_output=True,
+                timeout=10,
+                shell=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"path": str(workdir), "is_git": False, "error": str(exc)}
+        if result.returncode != 0:
+            return {"path": str(workdir), "is_git": False, "changed_files": []}
+        changed_files = result.stdout.decode("utf-8", errors="replace").splitlines()
+        return {
+            "path": str(workdir),
+            "is_git": True,
+            "changed_files": changed_files[:100],
+            "changed_count": len(changed_files),
+            "truncated": len(changed_files) > 100,
+        }
+
+    def _agent_command_with_id(self, command: str, prompt: str, cwd: str, timeout: int, run_id: str) -> tuple[str, int]:
         workdir = Path(cwd).expanduser().resolve()
         if not workdir.exists() or not workdir.is_dir():
             return f"作業ディレクトリが存在しません: {workdir}", 2
         command = command.strip()
         if not command:
-            return "エージェントコマンドが未設定です。右上の設定から、例: `codex exec` や `claude -p` を指定してください。", 0
+            return "エージェントコマンドが未設定です。右上の設定から、例: `codex exec` や `claude -p` を指定してください。", 2
         # {prompt} is replaced with one safely quoted argument. Without it, the
         # prompt is sent on stdin, which works with most CLI agents.
         rendered = command
@@ -503,19 +897,81 @@ class ResearchStore:
             rendered = command.replace("{prompt}", subprocess.list2cmdline([prompt]))
             stdin = ""
         try:
-            proc = subprocess.run(rendered, cwd=str(workdir), input=stdin, text=True, capture_output=True, timeout=max(10, min(timeout, 900)), shell=True)
-        except subprocess.TimeoutExpired:
-            return f"エージェントが{timeout}秒以内に終了しませんでした。", 124
-        output = (proc.stdout or "").strip()
-        if proc.stderr:
-            output = (output + "\n\n[stderr]\n" + proc.stderr.strip()).strip()
-        return output or "エージェントから出力がありませんでした。", proc.returncode
+            # Codex expects UTF-8 on stdin. Keep the transport byte-oriented
+            # instead of letting Windows choose the active code page.
+            proc = subprocess.Popen(rendered, cwd=str(workdir), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+            with self.process_lock:
+                self.active_processes[run_id] = proc
+            with self.process_lock:
+                self.run_states[run_id] = {"status": "running", "stdout": bytearray(), "stderr": bytearray(), "exit_code": None}
+
+            def drain(stream: Any, key: str) -> None:
+                try:
+                    while True:
+                        chunk = stream.read(4096)
+                        if not chunk:
+                            break
+                        with self.process_lock:
+                            buffer = self.run_states.get(run_id, {}).get(key)
+                            if buffer is not None:
+                                buffer.extend(chunk)
+                                del buffer[:-2_000_000]
+                except (OSError, ValueError):
+                    pass
+
+            readers = [
+                threading.Thread(target=drain, args=(proc.stdout, "stdout"), daemon=True),
+                threading.Thread(target=drain, args=(proc.stderr, "stderr"), daemon=True),
+            ]
+            for reader in readers: reader.start()
+            timed_out = False
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write(stdin.encode("utf-8"))
+                    proc.stdin.close()
+                proc.wait(timeout=max(10, min(timeout, 900)))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                self._terminate_process(proc)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait()
+            except (BrokenPipeError, OSError) as exc:
+                with self.process_lock:
+                    self.run_states[run_id]["status"] = "error"
+                    self.run_states[run_id]["exit_code"] = 1
+                return f"エージェントへの入力に失敗しました: {exc}", 1
+            finally:
+                for reader in readers: reader.join(timeout=5)
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+                with self.process_lock:
+                    state = self.run_states[run_id]
+                    state["exit_code"] = proc.returncode
+                    state["status"] = "finished" if proc.returncode == 0 else "failed"
+                    self.active_processes.pop(run_id, None)
+            output = bytes(state["stdout"]).decode("utf-8", errors="replace").strip()
+            stderr = bytes(state["stderr"]).decode("utf-8", errors="replace").strip()
+            if proc.returncode == -9 or proc.returncode == 1 and not output:
+                return "エージェントがキャンセルされました。", 130
+            if timed_out:
+                return (output + "\n\nエージェントをタイムアウトで終了しました。\n").strip(), 124
+            if proc.returncode != 0:
+                diagnostic = stderr[-4000:] if stderr else "エージェントからエラー詳細が返されませんでした。"
+                return (output + "\n\n[Agent error details]\n" + diagnostic).strip(), proc.returncode
+            # Codex and other CLIs write progress, environment information, and
+            # token counters to stderr even on success. That is diagnostics,
+            # not part of the assistant response, so keep it out of the chat.
+            return output or "エージェントから出力がありませんでした。", proc.returncode
+        except OSError as exc:
+            return f"エージェントの起動に失敗しました: {exc}", 1
 
     def _chat_memory(self, project_id: str | None, user_message: str, assistant_message: str, conversation_id: str) -> dict[str, Any] | None:
-        text = f"{user_message}\n{assistant_message}"
         explicit = user_message.strip().lower().startswith(("/remember", "/decision", "/failure", "/question", "/evidence", "/finding"))
-        signals = ("決定", "決め", "失敗", "原因", "結論", "知見", "覚えて", "重要", "次回", "decision", "failure", "lesson", "remember")
-        if not explicit and not any(signal in text.lower() for signal in signals):
+        agent_requested = "[[remember]]" in assistant_message.lower()
+        if not explicit and not agent_requested:
             return None
         first = user_message.strip().splitlines()[0] if user_message.strip() else "Chat insight"
         memory_type = "note"
@@ -531,13 +987,104 @@ class ResearchStore:
             "importance": .7 if explicit else .55, "confidence": .65,
         })
 
+    def _finish_chat(self, conversation_id: str, assistant: str, exit_code: int, workspace: str,
+                     command: str, settings: dict[str, str], run_id: str,
+                     memory: dict[str, Any] | None = None, imported: dict[str, Any] | None = None,
+                     context_used: bool = False) -> dict[str, Any]:
+        workspace_status = self.workspace_status(workspace)
+        with self.lock, self.connect() as db:
+            self._save_chat_message(db, conversation_id, "assistant", assistant, {"exit_code": exit_code, "workspace_dir": workspace, "agent_command": command, "workspace_status": workspace_status})
+            db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (NOW(), conversation_id))
+        transcript = self._write_conversation_projection(conversation_id)
+        project_id = self.conversation(conversation_id).get("project_id") if self.conversation(conversation_id) else None
+        if project_id:
+            self.sync_obsidian(settings["vault_path"], project_id)
+        return {"conversation_id": conversation_id, "run_id": run_id, "message": {"role": "assistant", "content": assistant, "exit_code": exit_code}, "memory": memory, "imported_obsidian": imported or {"count": 0}, "workspace_status": workspace_status, "transcript_path": transcript, "context_used": context_used, "settings": self.settings()}
+
+    def _handle_slash_command(self, message: str, project_id: str | None, conversation_id: str,
+                              settings: dict[str, str]) -> tuple[str, dict[str, Any] | None, dict[str, Any]] | None:
+        match = re.match(r"^/([a-zA-Z][\w-]*)(?:\s+(.*))?$", message, flags=re.DOTALL)
+        if not match:
+            return None
+        name = match.group(1).lower()
+        body = (match.group(2) or "").strip()
+        memory_types = {
+            "remember": "note", "decision": "decision", "failure": "failure",
+            "question": "question", "hypothesis": "hypothesis", "evidence": "evidence",
+            "finding": "finding", "experiment": "experiment", "procedure": "procedure",
+        }
+        if name in memory_types:
+            if not body:
+                return (f"/{name} には保存する内容を入力してください。例: /{name} 内容", None, {"count": 0})
+            if "|" in body:
+                title, content = (part.strip() for part in body.split("|", 1))
+            else:
+                title, content = body[:120], body
+            memory = self.create_memory({
+                "project_id": project_id, "type": memory_types[name], "title": title or memory_types[name].title(),
+                "content": content, "source_type": "slash_command", "source_id": conversation_id,
+                "confidence": .9, "importance": .75,
+            })
+            return (f"{memory_types[name].title()}として知識ベースに保存しました。\n\n{memory['title']}", memory, {"count": 0})
+        if name == "help":
+            return ("使えるコマンド:\n\n"
+                    "/remember 内容 — メモを保存\n/decision 内容 — Decisionを保存\n/failure 内容 — Failureを保存\n"
+                    "/question 内容 — Questionを保存\n/hypothesis 内容 — Hypothesisを保存\n/evidence 内容 — Evidenceを保存\n"
+                    "/finding 内容 — Findingを保存\n/experiment 内容 — Experimentを保存\n/procedure 内容 — Procedureを保存\n"
+                    "/objective 内容 — 研究目標を更新\n/status — 現在の研究状態\n/search キーワード — 知識を検索\n"
+                    "/context — Agent Context Packetを表示\n/sync — Vaultを同期\n/import — タグ付きノートを取り込み\n"
+                    "/forget — 古いMemoryを整理\n/consolidate — 類似Memoryを統合", None, {"count": 0})
+        if name == "objective":
+            if not project_id:
+                return ("プロジェクトが選択されていません。", None, {"count": 0})
+            if not body:
+                project = self.project(project_id)
+                return (f"Current objective: {project.get('current_objective') or '(not set)'}", None, {"count": 0})
+            project = self.update_project(project_id, {"current_objective": body})
+            return (f"研究目標を更新しました。\n\nCurrent objective: {project['current_objective']}", None, {"count": 0})
+        if name == "status":
+            if not project_id:
+                return ("プロジェクトが選択されていません。", None, {"count": 0})
+            overview = self.overview(project_id)
+            project = overview["project"]
+            counts = " / ".join(f"{state}: {overview['counts'].get(state, 0)}" for state in MEMORY_STATES)
+            return (f"# {project['name']}\n\n**Objective**\n{project.get('current_objective') or '(not set)'}\n\n"
+                    f"**Blockers**\n{chr(10).join('- ' + x for x in project.get('current_blockers', [])) or '- なし'}\n\n"
+                    f"**Next actions**\n{chr(10).join('- ' + x for x in project.get('next_actions', [])) or '- なし'}\n\n"
+                    f"**Memory**\n{counts}", None, {"count": 0})
+        if name == "search":
+            if not body:
+                return ("/search の後に検索語を入力してください。", None, {"count": 0})
+            results = self.search(body, project_id, "recall", 8)
+            if not results:
+                return ("該当する知識が見つかりませんでした。", None, {"count": 0})
+            text = "# Search results\n\n" + "\n\n".join(f"- **[{x['type']}] {x['title']}** — {x['state']}\n  {x['content'][:320]}" for x in results)
+            return (text, None, {"count": 0})
+        if name == "context":
+            if not project_id:
+                return ("プロジェクトが選択されていません。", None, {"count": 0})
+            return (self.compile_context(project_id, body, 12)["packet"], None, {"count": 0})
+        if name == "sync":
+            result = self.sync_obsidian(settings["vault_path"])
+            return (f"Vaultを同期しました。{result['count']}ファイルを更新しました。", None, result)
+        if name == "import":
+            result = self.import_obsidian(settings["vault_path"], project_id)
+            return (f"タグ付きObsidianノートを{result['count']}件取り込みました。", None, result)
+        if name == "forget":
+            result = self.forget()
+            return (f"Memoryの状態を更新しました。{result['count']}件が変更されました。", None, result)
+        if name == "consolidate":
+            result = self.consolidate(project_id)
+            return (f"Memoryを統合しました。{result['clusters']}クラスタを処理しました。", None, result)
+        return None
+
     def _write_conversation_projection(self, conversation_id: str) -> str:
         settings = self.settings(); vault = Path(settings["vault_path"]).expanduser().resolve(); vault.mkdir(parents=True, exist_ok=True)
         conversation = self.conversation(conversation_id)
         if not conversation: raise ValueError("conversation not found")
-        directory = vault / "Conversations"; directory.mkdir(parents=True, exist_ok=True)
-        filename = f"{conversation_id}-{slug(conversation['title'])}.md"
-        lines = ["---", f"id: {conversation_id}", f"project_id: {conversation.get('project_id') or ''}", "tags: [research-companion, conversation]", "---", f"# {conversation['title']}", ""]
+        directory = vault / PROJECTION_DIR / "Conversations"; directory.mkdir(parents=True, exist_ok=True)
+        filename = self._conversation_filename(conversation)
+        lines = ["<!-- Generated by Research Companion. Do not edit this file directly. -->", "---", f"id: {conversation_id}", f"project_id: {conversation.get('project_id') or ''}", "tags: [research-companion, conversation]", "type: conversation", "---", f"# {conversation['title']}", "", f"- [[{PROJECTION_DIR}/Home|Vault Home]]", ""]
         for message in conversation["messages"]:
             lines += [f"## {message['role'].title()} — {message['created_at']}", "", message["content"], ""]
         path = directory / filename; path.write_text("\n".join(lines), encoding="utf-8")
@@ -556,23 +1103,29 @@ class ResearchStore:
         workspace = str(data.get("workspace_dir") or conversation.get("workspace_dir") or settings["workspace_dir"])
         command = str(data.get("agent_command") if data.get("agent_command") is not None else conversation.get("agent_command") or settings["agent_command"])
         timeout = int(data.get("agent_timeout") or settings.get("agent_timeout", "180"))
-        context = self.compile_context(project_id, message, 8)["packet"] if project_id else ""
-        history = self.conversation(conversation_id)["messages"][-10:]
-        prompt = "You are the user's research/coding agent. Work in the supplied directory. Preserve provenance and do not invent facts.\n\nRESEARCH CONTEXT:\n" + context + "\n\nRECENT CHAT:\n" + "\n".join(f"{m['role']}: {m['content']}" for m in history) + f"\n\nUSER:\n{message}"
         with self.lock, self.connect() as db:
             self._save_chat_message(db, conversation_id, "user", message, {"workspace_dir": workspace})
             title = message[:60] if conversation.get("title") == "New research chat" else conversation["title"]
             db.execute("UPDATE conversations SET title=?,project_id=?,workspace_dir=?,agent_command=?,updated_at=? WHERE id=?", (title, project_id, workspace, command, NOW(), conversation_id))
-        assistant, exit_code = self._agent_command(command, prompt, workspace, timeout)
+
+        # App commands are deterministic and do not need to start an external
+        # process. Unknown slash-prefixed text remains available to arbitrary
+        # agents, so custom agent workflows are not restricted.
+        local_command = self._handle_slash_command(message, project_id, conversation_id, settings)
+        if local_command is not None:
+            assistant, memory, command_result = local_command
+            return self._finish_chat(conversation_id, assistant, 0, workspace, "local", settings,
+                                     str(data.get("run_id") or uid("local")), memory, command_result, False)
+
+        imported = self.import_obsidian(settings["vault_path"], project_id)
+        context = self.compile_context(project_id, message, 8)["packet"] if project_id else ""
+        history = self.conversation(conversation_id)["messages"][-11:-1]
+        prompt = "You are the user's research/coding agent. Work in the supplied directory. Preserve provenance and do not invent facts.\n\nRESEARCH CONTEXT:\n" + context + "\n\nRECENT CHAT:\n" + "\n".join(f"{m['role']}: {m['content']}" for m in history) + f"\n\nUSER:\n{message}"
+        run_id = str(data.get("run_id") or uid("run"))
+        assistant, exit_code = self._agent_command_with_id(command, prompt, workspace, timeout, run_id)
         if exit_code != 0: assistant = f"Agent error (exit {exit_code})\n\n{assistant}"
-        with self.lock, self.connect() as db:
-            self._save_chat_message(db, conversation_id, "assistant", assistant, {"exit_code": exit_code, "workspace_dir": workspace, "agent_command": command})
-            db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (NOW(), conversation_id))
-        memory = self._chat_memory(project_id, message, assistant, conversation_id)
-        transcript = self._write_conversation_projection(conversation_id)
-        if project_id:
-            self.sync_obsidian(settings["vault_path"], project_id)
-        return {"conversation_id": conversation_id, "message": {"role": "assistant", "content": assistant, "exit_code": exit_code}, "memory": memory, "transcript_path": transcript, "context_used": bool(context), "settings": self.settings()}
+        memory = self._chat_memory(project_id, message, assistant, conversation_id) if exit_code == 0 else None
+        return self._finish_chat(conversation_id, assistant, exit_code, workspace, command, settings, run_id, memory, imported, bool(context))
 
     def jobs(self) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -584,7 +1137,10 @@ class ResearchStore:
         elif job_name == "weekly_cross_project_review": result = {"consolidation": self.consolidate()}
         else: raise ValueError("unknown job")
         with self.lock, self.connect() as db:
-            db.execute("UPDATE jobs SET last_run=?,next_run=? WHERE name=?", (NOW(), datetime.fromtimestamp(time.time()+3600, timezone.utc).isoformat(timespec="seconds"), job_name))
+            row = db.execute("SELECT interval_seconds FROM jobs WHERE name=?", (job_name,)).fetchone()
+            interval = int(row["interval_seconds"]) if row else 3600
+            next_run = datetime.now(timezone.utc) + timedelta(seconds=interval)
+            db.execute("UPDATE jobs SET last_run=?,next_run=? WHERE name=?", (NOW(), next_run.isoformat(timespec="seconds"), job_name))
         return result
 
 
@@ -608,13 +1164,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
     store: ResearchStore
     server_version = "ResearchCompanion/1.0"
     def log_message(self, fmt: str, *args: Any) -> None: return
+    def _trusted_origin(self) -> str | None:
+        origin = self.headers.get("Origin")
+        return origin if not origin or origin in TRUSTED_ORIGINS else None
+    def _require_app_request(self) -> bool:
+        origin = self.headers.get("Origin")
+        if origin and origin not in TRUSTED_ORIGINS:
+            self._send(403, {"error": "untrusted origin"})
+            return False
+        if self.headers.get(APP_REQUEST_HEADER) != APP_REQUEST_VALUE:
+            self._send(403, {"error": "missing application request header"})
+            return False
+        return True
     def _send(self, status: int, payload: Any, content_type: str = "application/json") -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8") if content_type == "application/json" else payload.encode("utf-8")
-        self.send_response(status); self.send_header("Content-Type", f"{content_type}; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers(); self.wfile.write(body)
+        self.send_response(status); self.send_header("Content-Type", f"{content_type}; charset=utf-8"); self.send_header("Content-Length", str(len(body)))
+        origin = self._trusted_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.end_headers(); self.wfile.write(body)
     def _json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0")); return json.loads(self.rfile.read(length) or b"{}")
     def do_OPTIONS(self) -> None:
-        self.send_response(204); self.send_header("Access-Control-Allow-Origin", "*"); self.send_header("Access-Control-Allow-Headers", "Content-Type"); self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS"); self.end_headers()
+        origin = self.headers.get("Origin")
+        if origin not in TRUSTED_ORIGINS:
+            return self._send(403, {"error": "untrusted origin"})
+        self.send_response(204); self.send_header("Access-Control-Allow-Origin", origin); self.send_header("Vary", "Origin"); self.send_header("Access-Control-Allow-Headers", f"Content-Type, {APP_REQUEST_HEADER}"); self.send_header("Access-Control-Allow-Methods", "DELETE,GET,POST,PUT,OPTIONS"); self.end_headers()
     def do_GET(self) -> None:
         parsed = urlparse(self.path); path = parsed.path; q = parse_qs(parsed.query)
         try:
@@ -622,6 +1198,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == "/api/settings": return self._send(200, self.store.settings())
             if path == "/api/projects": return self._send(200, self.store.projects())
             if path == "/api/conversations": return self._send(200, self.store.conversations())
+            if path.startswith("/api/runs/"):
+                return self._send(200, self.store.run_status(path.rsplit("/", 1)[1]))
             if path.startswith("/api/conversations/"):
                 return self._send(200, self.store.conversation(path.rsplit("/", 1)[1]) or {"error": "not found"})
             if path.startswith("/api/projects/"):
@@ -644,26 +1222,74 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             return self._send(400, {"error": str(exc)})
     def do_POST(self) -> None:
-        path = urlparse(self.path).path; data = self._json()
+        if not self._require_app_request(): return
+        path = urlparse(self.path).path
         try:
-            if path == "/api/projects": return self._send(201, self.store.create_project(data))
+            data = self._json()
+            if path == "/api/projects":
+                result = self.store.create_project(data)
+                self.store.sync_obsidian(self.store.settings()["vault_path"], result["id"])
+                return self._send(201, result)
             if path == "/api/conversations": return self._send(201, self.store.create_conversation(data))
             if path == "/api/chat": return self._send(200, self.store.chat(data))
-            if path == "/api/memories": return self._send(201, self.store.create_memory(data))
+            if path == "/api/chat/cancel": return self._send(200, {"cancelled": self.store.cancel_agent(str(data.get("run_id", "")))})
+            if path == "/api/memories":
+                result = self.store.create_memory(data)
+                self.store.sync_obsidian(self.store.settings()["vault_path"], data.get("project_id"))
+                return self._send(201, result)
             if path == "/api/search": return self._send(200, {"results": self.store.search(data.get("query", ""), data.get("project_id"), data.get("intent", "recall"), int(data.get("limit", 12)))})
             if path == "/api/context/compile": return self._send(200, self.store.compile_context(data["project_id"], data.get("query", ""), int(data.get("limit", 12))))
-            if path == "/api/maintenance/forget": return self._send(200, self.store.forget())
-            if path == "/api/maintenance/consolidate": return self._send(200, self.store.consolidate(data.get("project_id")))
+            if path == "/api/maintenance/forget":
+                result = self.store.forget()
+                self.store.sync_obsidian(self.store.settings()["vault_path"])
+                return self._send(200, result)
+            if path == "/api/maintenance/consolidate":
+                result = self.store.consolidate(data.get("project_id"))
+                self.store.sync_obsidian(self.store.settings()["vault_path"], data.get("project_id"))
+                return self._send(200, result)
             if path == "/api/obsidian/sync": return self._send(200, self.store.sync_obsidian(data["vault"], data.get("project_id")))
-            if path == "/api/jobs/run": return self._send(200, self.store.run_job(data["name"]))
+            if path == "/api/obsidian/import": return self._send(200, self.store.import_obsidian(data["vault"], data.get("project_id")))
+            if path == "/api/jobs/run":
+                result = self.store.run_job(data["name"])
+                self.store.sync_obsidian(self.store.settings()["vault_path"])
+                return self._send(200, result)
+            return self._send(404, {"error": "not found"})
+        except Exception as exc:
+            return self._send(400, {"error": str(exc)})
+    def do_DELETE(self) -> None:
+        if not self._require_app_request(): return
+        path = urlparse(self.path).path
+        try:
+            if path.startswith("/api/conversations/"):
+                conversation_id = path.rsplit("/", 1)[1]
+                if not self.store.delete_conversation(conversation_id):
+                    return self._send(404, {"error": "conversation not found"})
+                return self._send(200, {"deleted": True, "conversation_id": conversation_id})
+            if path.startswith("/api/memories/"):
+                memory_id = path.rsplit("/", 1)[1]
+                if not self.store.delete_memory(memory_id):
+                    return self._send(404, {"error": "memory not found"})
+                self.store.sync_obsidian(self.store.settings()["vault_path"])
+                return self._send(200, {"deleted": True, "memory_id": memory_id})
             return self._send(404, {"error": "not found"})
         except Exception as exc:
             return self._send(400, {"error": str(exc)})
     def do_PUT(self) -> None:
-        path = urlparse(self.path).path; data = self._json()
+        if not self._require_app_request(): return
+        path = urlparse(self.path).path
         try:
+            data = self._json()
             if path == "/api/settings": return self._send(200, self.store.update_settings(data))
-            if path.startswith("/api/projects/"): return self._send(200, self.store.update_project(path.rsplit("/", 1)[1], data) or {"error": "not found"})
+            if path.startswith("/api/projects/"):
+                result = self.store.update_project(path.rsplit("/", 1)[1], data)
+                if result:
+                    self.store.sync_obsidian(self.store.settings()["vault_path"], result["id"])
+                return self._send(200, result or {"error": "not found"})
+            if path.startswith("/api/memories/"):
+                result = self.store.update_memory(path.rsplit("/", 1)[1], data)
+                if result:
+                    self.store.sync_obsidian(self.store.settings()["vault_path"], result.get("project_id"))
+                return self._send(200, result or {"error": "not found"})
             return self._send(404, {"error": "not found"})
         except Exception as exc:
             return self._send(400, {"error": str(exc)})
@@ -674,14 +1300,23 @@ def main() -> None:
     parser.add_argument("--host", default=os.getenv("RESEARCH_COMPANION_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("RESEARCH_COMPANION_PORT", "8765")))
     parser.add_argument("--db", default=os.getenv("RESEARCH_COMPANION_DB", str(DEFAULT_DB)))
+    parser.add_argument("--enable-scheduler", action="store_true", help="enable background maintenance jobs")
     args = parser.parse_args()
     Handler.store = ResearchStore(args.db)
-    scheduler = Scheduler(Handler.store); scheduler.start()
+    scheduler = Scheduler(Handler.store) if args.enable_scheduler or os.getenv("RESEARCH_COMPANION_ENABLE_SCHEDULER") == "1" else None
+    if scheduler: scheduler.start()
     server = http.server.ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"Research Companion OS running at http://{args.host}:{args.port}")
+    port_file = os.getenv("RESEARCH_COMPANION_PORT_FILE")
+    if port_file:
+        port_path = Path(port_file).expanduser().resolve()
+        port_path.parent.mkdir(parents=True, exist_ok=True)
+        port_path.write_text(str(server.server_address[1]), encoding="ascii")
+    print(f"Research Companion OS running at http://{args.host}:{server.server_address[1]}")
     try: server.serve_forever()
     except KeyboardInterrupt: pass
-    finally: scheduler.stop_event.set(); server.server_close()
+    finally:
+        if scheduler: scheduler.stop_event.set()
+        server.server_close()
 
 
 if __name__ == "__main__":

@@ -1,9 +1,15 @@
 research_companion.db
 smoke.db
 ui-smoke.db
-vault/*
-!vault/.gitkeep
 *.db-shm
 *.db-wal
 __pycache__/
+.obsidian/
 tests/__pycache__/
+native/target/
+native/src-tauri/target/
+native/node_modules/
+native/src-tauri/backend/*.exe
+native/pyinstaller-work/
+native/*.spec
+dist/
