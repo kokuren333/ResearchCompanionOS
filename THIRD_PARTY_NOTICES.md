@@ -5,6 +5,14 @@ Windows/CPU PDF Library. Their licenses are not the license of Research
 Companion itself; the corresponding notices must remain available in source
 and release distributions.
 
+## PyMuPDF
+
+- Project: https://github.com/pymupdf/PyMuPDF
+- Used by the layout-preserving translated-PDF writer for text rectangles,
+  redaction, and PDF output.
+- PyMuPDF is distributed under AGPL-3.0 or a commercial license. This
+  distribution uses the AGPL-3.0 option; see `licenses/AGPL-3.0.txt`.
+
 ## RapidOCR ONNX Runtime
 
 - Project: https://github.com/RapidAI/RapidOCR
@@ -31,6 +39,6 @@ and release distributions.
 The project at https://github.com/discus0434/pdf-translator is licensed under
 CC BY-NC 4.0. Its source code, model files, and Docker assets are not copied
 into this repository. Research Companion implements an independent CPU path
-with a similar side-by-side reading experience. If the upstream translator
+with a layout-preserving translated-PDF writer. If the upstream translator
 is used as an external service in the future, its CC BY-NC 4.0 attribution and
 license conditions must remain attached to that optional integration.

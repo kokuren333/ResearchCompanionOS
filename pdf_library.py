@@ -1,10 +1,7 @@
 """Small, Windows-friendly PDF library primitives.
 
-The upstream ``pdf-translator`` project uses GPU-backed OCR/layout models and
-Docker.  Research Companion keeps that project's user-facing idea (original
-page beside Japanese text) but does not vendor those model files.  This module
-handles local PDF storage, text extraction, and page rendering; translation
-and summarisation are delegated to the configured local agent.
+Text extraction and rendering stay local. Translation is delegated to the
+configured agent and the layout writer lives in :mod:`pdf_translate`.
 """
 
 from __future__ import annotations
@@ -110,3 +107,49 @@ def ocr_page(path: Path, page_number: int) -> str:
     else:
         texts = getattr(result, "txts", None) or []
     return "\n".join(str(text).strip() for text in texts if str(text).strip())
+
+
+def ocr_page_regions(path: Path, page_number: int) -> list[dict[str, Any]]:
+    """Return OCR text and PDF-point rectangles for scanned-page translation."""
+    try:
+        from PIL import Image
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError as exc:  # pragma: no cover - minimal installs
+        raise RuntimeError("画像PDFのOCRにはRapidOCRとPillowが必要です") from exc
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        _OCR_ENGINE = RapidOCR()
+    image_bytes = render_page(path, page_number)
+    image = Image.open(io.BytesIO(image_bytes))
+    result = _OCR_ENGINE(image)
+    rows = result[0] if isinstance(result, tuple) else getattr(result, "boxes", None)
+    if not rows:
+        return []
+    _, pypdfium2 = require_pdf_stack()
+    document = pypdfium2.PdfDocument(str(path))
+    try:
+        page = document[page_number - 1]
+        width, height = page.get_size()
+    finally:
+        page.close()
+        document.close()
+    scale_x, scale_y = image.width / width, image.height / height
+    regions: list[dict[str, Any]] = []
+    for row in rows:
+        if len(row) < 2:
+            continue
+        points, text = row[0], str(row[1]).strip()
+        if not text or not points:
+            continue
+        xs = [float(point[0]) for point in points]
+        ys = [float(point[1]) for point in points]
+        left, right = min(xs) / scale_x, max(xs) / scale_x
+        top, bottom = min(ys) / scale_y, max(ys) / scale_y
+        regions.append(
+            {
+                "text": text,
+                "bbox": [left, top, right, bottom],
+                "font_size": max(6.0, min(24.0, (bottom - top) * 0.8)),
+            }
+        )
+    return regions

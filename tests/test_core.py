@@ -5,6 +5,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from app import ResearchStore
 from pypdf import PdfWriter
@@ -273,6 +274,56 @@ class ResearchCompanionCoreTests(unittest.TestCase):
         self.assertFalse(old_path.exists())
         self.assertTrue(self.store.delete_pdf(document["id"]))
         self.assertFalse(Path(migrated["stored_path"]).exists())
+
+    def test_scanned_pdf_ocr_runs_in_background_and_updates_progress(self):
+        source = Path(self.temp.name) / "scanned.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+        self.store.update_settings({"vault_path": str(Path(self.temp.name) / "ocr-vault")})
+        with patch("app.ocr_page", return_value="Recovered OCR text") as ocr:
+            imported = self.store.import_pdf({"project_id": self.project["id"], "path": str(source), "ocr": True})
+            self.assertTrue(imported["ocr_task_id"])
+            deadline = time.time() + 10
+            document = self.store.pdf(imported["document"]["id"])
+            while document["ocr_status"] in {"pending", "processing"} and time.time() < deadline:
+                time.sleep(.05)
+                document = self.store.pdf(imported["document"]["id"])
+            self.assertEqual(document["ocr_status"], "completed")
+            self.assertEqual(document["ocr_pages_done"], 1)
+            self.assertEqual(document["pages"][0]["text"], "Recovered OCR text")
+            self.assertTrue(ocr.called)
+
+    def test_layout_translation_creates_separate_pdf_without_overwriting_original(self):
+        import fitz
+
+        source = Path(self.temp.name) / "layout-paper.pdf"
+        pdf = fitz.open()
+        page = pdf.new_page(width=300, height=400)
+        page.insert_text((30, 60), "Attention is important", fontsize=12)
+        pdf.save(str(source))
+        pdf.close()
+        vault = Path(self.temp.name) / "layout-vault"
+        self.store.update_settings({"vault_path": str(vault)})
+        imported = self.store.import_pdf({"project_id": self.project["id"], "path": str(source), "discipline": "Layout", "ocr": False})
+        original = Path(imported["document"]["stored_path"])
+        with patch.object(self.store, "_agent_command_with_id", return_value=('[{"id":"p1b0","translation":"重要な注意事項"}]', 0)):
+            started = self.store.start_pdf_translation(imported["document"]["id"])
+            self.assertTrue(started["task_id"])
+            deadline = time.time() + 10
+            document = self.store.pdf(imported["document"]["id"])
+            while document["translation_status"] in {"queued", "processing"} and time.time() < deadline:
+                time.sleep(.05)
+                document = self.store.pdf(imported["document"]["id"])
+        self.assertEqual(document["translation_status"], "completed")
+        translated = Path(document["translated_path"])
+        self.assertTrue(original.exists())
+        self.assertTrue(translated.exists())
+        self.assertNotEqual(original, translated)
+        translated_doc = fitz.open(str(translated))
+        self.assertEqual(len(translated_doc), 1)
+        translated_doc.close()
 
 
 if __name__ == "__main__":

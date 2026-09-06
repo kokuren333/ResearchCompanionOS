@@ -28,6 +28,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from pdf_library import copy_into_library, inspect_pdf, ocr_page, render_page, safe_name
+from pdf_translate import extract_layout_blocks, parse_translation_json, render_translated_pdf
 
 
 ROOT = Path(__file__).resolve().parent
@@ -136,9 +137,13 @@ class ResearchStore:
         self.db_path = str(db_path)
         self.lock = threading.RLock()
         self.process_lock = threading.RLock()
+        self.pdf_task_lock = threading.RLock()
+        self.ocr_lock = threading.RLock()
         self.active_processes: dict[str, subprocess.Popen[bytes]] = {}
         self.run_states: dict[str, dict[str, Any]] = {}
+        self.pdf_tasks: dict[str, dict[str, Any]] = {}
         self._init_db()
+        self._resume_pending_pdf_ocr()
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.db_path, timeout=30, factory=ClosingConnection)
@@ -209,12 +214,18 @@ class ResearchStore:
                     discipline TEXT NOT NULL DEFAULT 'Uncategorized', author TEXT DEFAULT '',
                     page_count INTEGER NOT NULL DEFAULT 0, file_size INTEGER NOT NULL DEFAULT 0,
                     sha256 TEXT NOT NULL, extracted_text TEXT DEFAULT '', summary TEXT DEFAULT '',
+                    ocr_status TEXT DEFAULT 'not_needed', ocr_pages_total INTEGER DEFAULT 0,
+                    ocr_pages_done INTEGER DEFAULT 0,
+                    translated_path TEXT DEFAULT '', translation_status TEXT DEFAULT 'not_started',
+                    translation_error TEXT DEFAULT '', translation_pages_total INTEGER DEFAULT 0,
+                    translation_pages_done INTEGER DEFAULT 0, translation_engine TEXT DEFAULT 'codex-layout',
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
                 );
                 CREATE TABLE IF NOT EXISTS pdf_pages (
                     id TEXT PRIMARY KEY, pdf_id TEXT NOT NULL, page_number INTEGER NOT NULL,
                     text TEXT DEFAULT '', translation TEXT DEFAULT '', translation_status TEXT DEFAULT 'not_started',
+                    ocr_status TEXT DEFAULT 'not_needed', ocr_error TEXT DEFAULT '',
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     UNIQUE(pdf_id, page_number),
                     FOREIGN KEY(pdf_id) REFERENCES pdf_documents(id) ON DELETE CASCADE
@@ -228,6 +239,31 @@ class ResearchStore:
                     ('job_weekly','weekly_cross_project_review',604800,NULL);
                 """
             )
+            existing_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(pdf_documents)").fetchall()
+            }
+            for name, definition in (
+                ("ocr_status", "TEXT DEFAULT 'not_needed'"),
+                ("ocr_pages_total", "INTEGER DEFAULT 0"),
+                ("ocr_pages_done", "INTEGER DEFAULT 0"),
+                ("translated_path", "TEXT DEFAULT ''"),
+                ("translation_status", "TEXT DEFAULT 'not_started'"),
+                ("translation_error", "TEXT DEFAULT ''"),
+                ("translation_pages_total", "INTEGER DEFAULT 0"),
+                ("translation_pages_done", "INTEGER DEFAULT 0"),
+                ("translation_engine", "TEXT DEFAULT 'codex-layout'"),
+            ):
+                if name not in existing_columns:
+                    db.execute(f"ALTER TABLE pdf_documents ADD COLUMN {name} {definition}")
+            existing_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(pdf_pages)").fetchall()
+            }
+            for name, definition in (
+                ("ocr_status", "TEXT DEFAULT 'not_needed'"),
+                ("ocr_error", "TEXT DEFAULT ''"),
+            ):
+                if name not in existing_columns:
+                    db.execute(f"ALTER TABLE pdf_pages ADD COLUMN {name} {definition}")
         DEFAULT_VAULT.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             defaults = {
@@ -300,7 +336,7 @@ class ResearchStore:
                 raise ValueError("最後のプロジェクトは削除できません")
             memory_ids = [r[0] for r in db.execute("SELECT id FROM memories WHERE project_id=?", (project_id,)).fetchall()]
             conversation_ids = [r[0] for r in db.execute("SELECT id FROM conversations WHERE project_id=?", (project_id,)).fetchall()]
-            pdf_rows = db.execute("SELECT id,stored_path FROM pdf_documents WHERE project_id=?", (project_id,)).fetchall()
+            pdf_rows = db.execute("SELECT id,stored_path,translated_path FROM pdf_documents WHERE project_id=?", (project_id,)).fetchall()
             pdf_ids = [r[0] for r in pdf_rows]
             for conversation_id in conversation_ids:
                 db.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
@@ -310,12 +346,15 @@ class ResearchStore:
             db.execute("DELETE FROM projects WHERE id=?", (project_id,))
         library_root = (Path(self.settings()["vault_path"]).expanduser().resolve() / PROJECTION_DIR / "PDF Library").resolve()
         for row in pdf_rows:
-            path = Path(row[1]).expanduser().resolve()
-            if library_root in path.parents and path.is_file():
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+            for raw_path in row[1:]:
+                if not raw_path:
+                    continue
+                path = Path(raw_path).expanduser().resolve()
+                if library_root in path.parents and path.is_file():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
         return {"project_id": project_id, "name": project["name"], "memories": len(memory_ids), "conversations": len(conversation_ids), "pdfs": len(pdf_ids)}
 
     def pdfs(self, project_id: str | None = None, limit: int = 1000) -> list[dict[str, Any]]:
@@ -324,7 +363,7 @@ class ResearchStore:
             clauses.append("project_id=?"); args.append(project_id)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.connect() as db:
-            rows = db.execute(f"SELECT id,project_id,title,original_filename,stored_path,discipline,author,page_count,file_size,sha256,summary,created_at,updated_at FROM pdf_documents{where} ORDER BY updated_at DESC LIMIT ?", (*args, max(1, min(int(limit), 100000)))).fetchall()
+            rows = db.execute(f"SELECT id,project_id,title,original_filename,stored_path,discipline,author,page_count,file_size,sha256,summary,ocr_status,ocr_pages_total,ocr_pages_done,translated_path,translation_status,translation_error,translation_pages_total,translation_pages_done,translation_engine,created_at,updated_at FROM pdf_documents{where} ORDER BY updated_at DESC LIMIT ?", (*args, max(1, min(int(limit), 100000)))).fetchall()
             return [dict(row) for row in rows]
 
     def pdf(self, pdf_id: str) -> dict[str, Any] | None:
@@ -333,8 +372,196 @@ class ResearchStore:
             if not row:
                 return None
             item = dict(row)
-            item["pages"] = [dict(page) for page in db.execute("SELECT id,page_number,text,translation,translation_status,created_at,updated_at FROM pdf_pages WHERE pdf_id=? ORDER BY page_number", (pdf_id,)).fetchall()]
+            item["pages"] = [dict(page) for page in db.execute("SELECT id,page_number,text,translation,translation_status,ocr_status,ocr_error,created_at,updated_at FROM pdf_pages WHERE pdf_id=? ORDER BY page_number", (pdf_id,)).fetchall()]
             return item
+
+    def _refresh_pdf_ocr_progress(self, pdf_id: str) -> dict[str, Any] | None:
+        with self.lock, self.connect() as db:
+            rows = db.execute("SELECT ocr_status,ocr_error FROM pdf_pages WHERE pdf_id=?", (pdf_id,)).fetchall()
+            if not rows:
+                return self.pdf(pdf_id)
+            total = sum(row["ocr_status"] in {"pending", "processing", "done", "failed"} for row in rows)
+            done = sum(row["ocr_status"] in {"done", "failed"} for row in rows)
+            failed = sum(row["ocr_status"] == "failed" for row in rows)
+            if total == 0:
+                status = "not_needed"
+            elif done < total:
+                status = "processing" if any(row["ocr_status"] == "processing" for row in rows) else "pending"
+            else:
+                status = "failed" if failed else "completed"
+            extracted = "\n\n".join(
+                f"[Page {index + 1}]\n{row['text']}"
+                for index, row in enumerate(db.execute("SELECT page_number,text FROM pdf_pages WHERE pdf_id=? ORDER BY page_number", (pdf_id,)).fetchall())
+                if row["text"]
+            )
+            db.execute("UPDATE pdf_documents SET extracted_text=?,ocr_status=?,ocr_pages_total=?,ocr_pages_done=?,updated_at=? WHERE id=?", (extracted, status, total, done, NOW(), pdf_id))
+        return self.pdf(pdf_id)
+
+    def _set_pdf_task(self, task_id: str, **changes: Any) -> None:
+        with self.pdf_task_lock:
+            if task_id in self.pdf_tasks:
+                self.pdf_tasks[task_id].update(changes)
+
+    def pdf_ocr_task(self, task_id: str) -> dict[str, Any]:
+        with self.pdf_task_lock:
+            task = dict(self.pdf_tasks.get(task_id, {}))
+        if not task:
+            return {"task_id": task_id, "status": "not_found"}
+        return task
+
+    def start_pdf_ocr(self, pdf_id: str) -> dict[str, Any]:
+        document = self.pdf(pdf_id)
+        if not document:
+            raise ValueError("PDFが見つかりません")
+        with self.lock, self.connect() as db:
+            pending = [
+                row["page_number"]
+                for row in db.execute("SELECT page_number FROM pdf_pages WHERE pdf_id=? AND ocr_status IN ('pending','processing') ORDER BY page_number", (pdf_id,)).fetchall()
+            ]
+            db.execute("UPDATE pdf_pages SET ocr_status='pending',ocr_error='' WHERE pdf_id=? AND ocr_status='processing'", (pdf_id,))
+        if not pending:
+            return {"task_id": None, "document": self._refresh_pdf_ocr_progress(pdf_id)}
+        with self.pdf_task_lock:
+            existing = next((key for key, value in self.pdf_tasks.items() if value.get("pdf_id") == pdf_id and value.get("status") in {"queued", "processing"}), None)
+            if existing:
+                return {"task_id": existing, "document": self.pdf(pdf_id)}
+            task_id = uid("pdfocr")
+            self.pdf_tasks[task_id] = {"task_id": task_id, "pdf_id": pdf_id, "status": "queued", "total": len(pending), "done": 0, "failed": 0, "error": ""}
+        thread = threading.Thread(target=self._run_pdf_ocr, args=(task_id, pdf_id, pending), daemon=True)
+        thread.start()
+        return {"task_id": task_id, "document": self.pdf(pdf_id)}
+
+    def _run_pdf_ocr(self, task_id: str, pdf_id: str, pages: list[int]) -> None:
+        self._set_pdf_task(task_id, status="processing")
+        for page_number in pages:
+            try:
+                path = self._pdf_path(pdf_id)
+                with self.lock, self.connect() as db:
+                    db.execute("UPDATE pdf_pages SET ocr_status='processing',ocr_error='',updated_at=? WHERE pdf_id=? AND page_number=?", (NOW(), pdf_id, page_number))
+                with self.ocr_lock:
+                    text = ocr_page(path, page_number).strip()
+                with self.lock, self.connect() as db:
+                    db.execute("UPDATE pdf_pages SET text=?,ocr_status=?,ocr_error='',updated_at=? WHERE pdf_id=? AND page_number=?", (text, "done" if text else "failed", NOW(), pdf_id, page_number))
+                if not text:
+                    self._set_pdf_task(task_id, failed=self.pdf_tasks[task_id].get("failed", 0) + 1, error=f"page {page_number}: OCR returned no text")
+            except Exception as exc:
+                with self.lock, self.connect() as db:
+                    db.execute("UPDATE pdf_pages SET ocr_status='failed',ocr_error=?,updated_at=? WHERE pdf_id=? AND page_number=?", (str(exc), NOW(), pdf_id, page_number))
+                with self.pdf_task_lock:
+                    failed = self.pdf_tasks.get(task_id, {}).get("failed", 0) + 1
+                self._set_pdf_task(task_id, failed=failed, error=str(exc))
+            finally:
+                with self.pdf_task_lock:
+                    done = self.pdf_tasks.get(task_id, {}).get("done", 0) + 1
+                self._set_pdf_task(task_id, done=done)
+                self._refresh_pdf_ocr_progress(pdf_id)
+        with self.pdf_task_lock:
+            failed = self.pdf_tasks.get(task_id, {}).get("failed", 0)
+        self._set_pdf_task(task_id, status="failed" if failed else "completed")
+        # Keep this final database operation last so a client observing a
+        # completed document also observes a finished worker shortly after.
+        self._refresh_pdf_ocr_progress(pdf_id)
+
+    def _resume_pending_pdf_ocr(self) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE pdf_pages SET ocr_status='pending' WHERE ocr_status='processing'")
+            ids = [row[0] for row in db.execute("SELECT DISTINCT pdf_id FROM pdf_pages WHERE ocr_status='pending'").fetchall()]
+        for pdf_id in ids:
+            try:
+                self.start_pdf_ocr(pdf_id)
+            except (OSError, ValueError):
+                continue
+
+    def _set_pdf_document_translation(self, pdf_id: str, status: str, error: str = "", done: int | None = None, path: str | None = None) -> None:
+        sets = ["translation_status=?", "translation_error=?", "updated_at=?"]
+        values: list[Any] = [status, error, NOW()]
+        if done is not None:
+            sets.append("translation_pages_done=?")
+            values.append(done)
+        if path is not None:
+            sets.append("translated_path=?")
+            values.append(path)
+        values.append(pdf_id)
+        with self.lock, self.connect() as db:
+            db.execute(f"UPDATE pdf_documents SET {', '.join(sets)} WHERE id=?", values)
+
+    def _translate_layout_page(self, settings: dict[str, Any], page_number: int, blocks: list[dict[str, Any]]) -> dict[str, str]:
+        candidates = [block for block in blocks if not block.get("formula_like") and len(block.get("text", "").strip()) >= 2]
+        if not candidates:
+            return {}
+        payload = json.dumps(
+            [{"id": block["id"], "source": block["text"]} for block in candidates],
+            ensure_ascii=False,
+        )
+        prompt = (
+            "You are translating a scientific paper from English to Japanese for a layout-preserving PDF. "
+            "Translate every source item, keep each id exactly, and return ONLY a JSON array of objects "
+            "with the same ids and a translation field. Preserve citations, names, numbers, units, inline "
+            "notation, and uncertainty. Do not add Markdown, explanations, or commentary. "
+            "The text will be placed inside the original rectangle, so use concise natural Japanese and "
+            "do not join or split items.\n\nINPUT:\n" + payload
+        )
+        output, code = self._agent_command_with_id(
+            settings["agent_command"], prompt, settings["workspace_dir"], int(settings.get("agent_timeout", "180")), uid("pdf-layout-translate")
+        )
+        if code != 0:
+            raise ValueError(f"レイアウト翻訳エージェントが失敗しました (exit {code})\\n{output[-1200:]}")
+        translations = parse_translation_json(output, [block["id"] for block in candidates])
+        if len(translations) != len(candidates):
+            missing = [block["id"] for block in candidates if block["id"] not in translations]
+            raise ValueError(f"翻訳結果のJSONが不完全です。欠落したブロック: {', '.join(missing[:8])}")
+        return translations
+
+    def start_pdf_translation(self, pdf_id: str) -> dict[str, Any]:
+        document = self.pdf(pdf_id)
+        if not document:
+            raise ValueError("PDFが見つかりません")
+        if document.get("ocr_status") in {"pending", "processing"}:
+            raise ValueError("画像ページのOCRが完了してから翻訳PDFを生成してください")
+        with self.pdf_task_lock:
+            existing = next((key for key, value in self.pdf_tasks.items() if value.get("pdf_id") == pdf_id and value.get("kind") == "translation" and value.get("status") in {"queued", "processing"}), None)
+            if existing:
+                return {"task_id": existing, "document": self.pdf(pdf_id)}
+            task_id = uid("pdftranslate")
+            total = int(document.get("page_count") or len(document.get("pages") or []))
+            self.pdf_tasks[task_id] = {"task_id": task_id, "pdf_id": pdf_id, "kind": "translation", "status": "queued", "total": total, "done": 0, "failed": 0, "error": ""}
+        self._set_pdf_document_translation(pdf_id, "queued", "", 0)
+        thread = threading.Thread(target=self._run_pdf_translation, args=(task_id, pdf_id), daemon=True)
+        thread.start()
+        return {"task_id": task_id, "document": self.pdf(pdf_id)}
+
+    def _run_pdf_translation(self, task_id: str, pdf_id: str) -> None:
+        try:
+            self._set_pdf_task(task_id, status="processing")
+            self._set_pdf_document_translation(pdf_id, "processing", "", 0)
+            document = self.pdf(pdf_id)
+            if not document:
+                raise ValueError("PDFが見つかりません")
+            source = self._pdf_path(pdf_id)
+            settings = self.settings()
+            translated_pages: dict[int, dict[str, str]] = {}
+            total = int(document.get("page_count") or len(document.get("pages") or []))
+            for page_number in range(1, total + 1):
+                blocks = extract_layout_blocks(source, page_number)
+                translations = self._translate_layout_page(settings, page_number, blocks)
+                translated_pages[page_number] = translations
+                page_translation = "\n".join(translations.values())
+                with self.lock, self.connect() as db:
+                    db.execute("UPDATE pdf_pages SET translation=?,translation_status=?,updated_at=? WHERE pdf_id=? AND page_number=?", (page_translation, "translated" if translations else "not_started", NOW(), pdf_id, page_number))
+                with self.pdf_task_lock:
+                    done = self.pdf_tasks.get(task_id, {}).get("done", 0) + 1
+                self._set_pdf_task(task_id, done=done)
+                self._set_pdf_document_translation(pdf_id, "processing", "", done)
+            destination = source.with_name(f"{source.stem}-ja.pdf")
+            result = render_translated_pdf(source, destination, translated_pages)
+            self.sync_obsidian(self.settings()["vault_path"], document.get("project_id"))
+            self._set_pdf_document_translation(pdf_id, "completed", "", total, result["path"])
+            self._set_pdf_task(task_id, status="completed", output_path=result["path"])
+        except Exception as exc:
+            self._set_pdf_document_translation(pdf_id, "failed", str(exc))
+            with self.pdf_task_lock:
+                failed = self.pdf_tasks.get(task_id, {}).get("failed", 0) + 1
+            self._set_pdf_task(task_id, status="failed", failed=failed, error=str(exc))
 
     def _pdf_path(self, pdf_id: str) -> Path:
         with self.connect() as db:
@@ -344,6 +571,16 @@ class ResearchStore:
         path = Path(row[0]).expanduser().resolve()
         if not path.is_file():
             raise ValueError("保存済みPDFが見つかりません。Vaultの場所を確認してください")
+        return path
+
+    def _translated_pdf_path(self, pdf_id: str) -> Path:
+        with self.connect() as db:
+            row = db.execute("SELECT translated_path FROM pdf_documents WHERE id=?", (pdf_id,)).fetchone()
+        if not row or not row[0]:
+            raise ValueError("このPDFの翻訳版はまだ生成されていません")
+        path = Path(row[0]).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError("保存済みの翻訳PDFが見つかりません。再生成してください")
         return path
 
     def import_pdf(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -365,19 +602,10 @@ class ResearchStore:
             else:
                 raise ValueError("PDFファイルを選択してください")
             info = inspect_pdf(source_path)
-            ocr_pages: list[int] = []
-            if data.get("ocr", True):
-                for page_number, text in enumerate(info["pages"], 1):
-                    if text:
-                        continue
-                    try:
-                        recovered = ocr_page(source_path, page_number)
-                    except RuntimeError:
-                        recovered = ""
-                    if recovered:
-                        info["pages"][page_number - 1] = recovered
-                        ocr_pages.append(page_number)
-                info["text"] = "\n\n".join(f"[Page {index + 1}]\n{text}" for index, text in enumerate(info["pages"]) if text)
+            ocr_pending_pages = [
+                page_number for page_number, text in enumerate(info["pages"], 1)
+                if data.get("ocr", True) and not text
+            ]
             with self.connect() as db:
                 duplicate = db.execute("SELECT id FROM pdf_documents WHERE sha256=? AND (project_id=? OR (? IS NULL AND project_id IS NULL)) LIMIT 1", (info["sha256"], project_id, project_id)).fetchone()
             if duplicate:
@@ -389,25 +617,31 @@ class ResearchStore:
             title = str(data.get("title") or info["title"] or source_path.stem).strip()[:240] or source_path.stem
             now = NOW()
             with self.lock, self.connect() as db:
-                db.execute("INSERT INTO pdf_documents(id,project_id,title,original_filename,stored_path,discipline,author,page_count,file_size,sha256,extracted_text,summary,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (pdf_id, project_id, title, source_path.name, str(stored_path), discipline, info["author"], info["page_count"], info["file_size"], info["sha256"], info["text"], "", now, now))
+                ocr_status = "pending" if ocr_pending_pages else "not_needed"
+                db.execute("INSERT INTO pdf_documents(id,project_id,title,original_filename,stored_path,discipline,author,page_count,file_size,sha256,extracted_text,summary,ocr_status,ocr_pages_total,ocr_pages_done,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (pdf_id, project_id, title, source_path.name, str(stored_path), discipline, info["author"], info["page_count"], info["file_size"], info["sha256"], info["text"], "", ocr_status, len(ocr_pending_pages), 0, now, now))
                 for page_number, text in enumerate(info["pages"], 1):
-                    db.execute("INSERT INTO pdf_pages(id,pdf_id,page_number,text,created_at,updated_at) VALUES(?,?,?,?,?,?)", (uid("pdfpage"), pdf_id, page_number, text, now, now))
-            return {"duplicate": False, "ocr_pages": ocr_pages, "document": self.pdf(pdf_id)}
+                    page_ocr_status = "pending" if page_number in ocr_pending_pages else "not_needed"
+                    db.execute("INSERT INTO pdf_pages(id,pdf_id,page_number,text,ocr_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (uid("pdfpage"), pdf_id, page_number, text, page_ocr_status, now, now))
+            ocr_task = self.start_pdf_ocr(pdf_id) if ocr_pending_pages else {"task_id": None}
+            return {"duplicate": False, "ocr_pages": [], "ocr_pending_pages": ocr_pending_pages, "ocr_task_id": ocr_task.get("task_id"), "document": self.pdf(pdf_id)}
         finally:
             if temporary_path and temporary_path.is_file():
                 temporary_path.unlink()
 
     def delete_pdf(self, pdf_id: str) -> bool:
         with self.lock, self.connect() as db:
-            row = db.execute("SELECT stored_path FROM pdf_documents WHERE id=?", (pdf_id,)).fetchone()
+            row = db.execute("SELECT stored_path,translated_path FROM pdf_documents WHERE id=?", (pdf_id,)).fetchone()
             if not row:
                 return False
-            path = Path(row[0]).expanduser().resolve()
             vault = Path(self.settings()["vault_path"]).expanduser().resolve()
             library_root = (vault / PROJECTION_DIR / "PDF Library").resolve()
             db.execute("DELETE FROM pdf_documents WHERE id=?", (pdf_id,))
-        if library_root in path.parents and path.is_file():
-            path.unlink()
+        for raw_path in row:
+            if not raw_path:
+                continue
+            path = Path(raw_path).expanduser().resolve()
+            if library_root in path.parents and path.is_file():
+                path.unlink()
         return True
 
     def summarize_pdf(self, pdf_id: str) -> dict[str, Any]:
@@ -884,7 +1118,8 @@ class ResearchStore:
                 pdf_note = [
                     "<!-- Generated by Research Companion. Do not edit this file directly. -->",
                     "---", f"id: {pdf['id']}", f"project_id: {project['id']}", f"discipline: {pdf['discipline']}", f"page_count: {pdf['page_count']}", "tags: [research-companion, paper]", "type: paper", "---",
-                    f"# {pdf['title']}", "", f"- Project: [[{project_paths[project['id']]}|{project['name']}]]", f"- Original filename: `{pdf['original_filename']}`", f"- Stored PDF: `{pdf['stored_path']}`", "",
+                    f"# {pdf['title']}", "", f"- Project: [[{project_paths[project['id']]}|{project['name']}]]", f"- Original filename: `{pdf['original_filename']}`", f"- Stored PDF: `{pdf['stored_path']}`",
+                    f"- Layout-translated PDF: `{pdf['translated_path']}`" if pdf.get("translated_path") else "- Layout-translated PDF: アプリのPDF Readerから生成できます。", "",
                     "## Summary", "", pdf.get("summary") or "まだ要約されていません。アプリのPDF Libraryから要約を実行してください。", "",
                     "## Reading notes", "", "このページはPDFのメタデータと要約を保持する投影です。原文ページと翻訳はアプリのPDF Readerで確認してください。",
                 ]
@@ -1019,24 +1254,32 @@ class ResearchStore:
         if not old_root.is_dir():
             return
         with self.connect() as db:
-            rows = db.execute("SELECT id,stored_path,discipline FROM pdf_documents").fetchall()
-        moved: list[tuple[str, str]] = []
+            rows = db.execute("SELECT id,stored_path,translated_path,discipline FROM pdf_documents").fetchall()
+        moved: list[tuple[str, str, str]] = []
         for row in rows:
             source = Path(row["stored_path"]).expanduser().resolve()
             if source == old_root or old_root not in source.parents or not source.is_file():
                 continue
             target = copy_into_library(source, new_vault, row["id"], row["discipline"])
+            translated_source = Path(row["translated_path"]).expanduser().resolve() if row["translated_path"] else None
+            translated_target = target.with_name(f"{target.stem}-ja.pdf")
+            if translated_source and old_root in translated_source.parents and translated_source.is_file():
+                shutil.copy2(translated_source, translated_target)
             try:
                 source.unlink()
+                if translated_source and translated_source != source and translated_source.is_file() and old_root in translated_source.parents:
+                    translated_source.unlink()
             except OSError:
                 if target.is_file():
                     target.unlink()
+                if translated_target.is_file():
+                    translated_target.unlink()
                 continue
-            moved.append((str(target), row["id"]))
+            moved.append((str(target), str(translated_target) if translated_target.is_file() else (str(translated_source) if translated_source else ""), row["id"]))
         if moved:
             with self.lock, self.connect() as db:
-                for stored_path, pdf_id in moved:
-                    db.execute("UPDATE pdf_documents SET stored_path=?,updated_at=? WHERE id=?", (stored_path, NOW(), pdf_id))
+                for stored_path, translated_path, pdf_id in moved:
+                    db.execute("UPDATE pdf_documents SET stored_path=?,translated_path=?,updated_at=? WHERE id=?", (stored_path, translated_path, NOW(), pdf_id))
         try:
             for directory in sorted(old_root.rglob("*"), reverse=True):
                 if directory.is_dir():
@@ -1528,6 +1771,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if len(parts) == 5 and parts[4] == "file":
                     pdf_path = self.store._pdf_path(pdf_id)
                     return self._send_bytes(200, pdf_path.read_bytes(), "application/pdf")
+                if len(parts) == 5 and parts[4] == "translated":
+                    pdf_path = self.store._translated_pdf_path(pdf_id)
+                    return self._send_bytes(200, pdf_path.read_bytes(), "application/pdf")
+                if len(parts) == 5 and parts[4] == "ocr":
+                    task_id = q.get("task_id", [None])[0]
+                    return self._send(200, self.store.pdf_ocr_task(task_id) if task_id else (self.store.pdf(pdf_id) or {"error": "not found"}))
+                if len(parts) == 5 and parts[4] == "translation":
+                    task_id = q.get("task_id", [None])[0]
+                    return self._send(200, self.store.pdf_ocr_task(task_id) if task_id else (self.store.pdf(pdf_id) or {"error": "not found"}))
                 if len(parts) == 6 and parts[4] == "page":
                     return self._send_bytes(200, render_page(self.store._pdf_path(pdf_id), int(parts[5])), "image/png")
                 return self._send(200, self.store.pdf(pdf_id) or {"error": "not found"})
@@ -1575,6 +1827,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path.startswith("/api/pdfs/") and path.endswith("/translate"):
                 pdf_id = path.split("/")[3]
                 return self._send(200, self.store.translate_pdf_page(pdf_id, int(data.get("page_number", 0))))
+            if path.startswith("/api/pdfs/") and path.endswith("/translate-pdf"):
+                pdf_id = path.split("/")[3]
+                return self._send(202, self.store.start_pdf_translation(pdf_id))
             if path == "/api/conversations": return self._send(201, self.store.create_conversation(data))
             if path == "/api/chat": return self._send(200, self.store.chat(data))
             if path == "/api/chat/cancel": return self._send(200, {"cancelled": self.store.cancel_agent(str(data.get("run_id", "")))})

@@ -2,7 +2,7 @@
 
 [日本語版 / Japanese](README.ja.md) · [Project overview](README.md)
 
-Research Companion OS is a local-first research continuity tool. Its normal interface is a ChatGPT-style chat. The app keeps durable research state and structured memories in SQLite, compiles a small context packet for an agent, and projects the resulting knowledge into a navigable Obsidian vault. Research PDFs can be stored by discipline and read with the original page beside CPU-OCR/agent translation text.
+Research Companion OS is a local-first research continuity tool. Its normal interface is a ChatGPT-style chat. The app keeps durable research state and structured memories in SQLite, compiles a small context packet for an agent, and projects the resulting knowledge into a navigable Obsidian vault. Research PDFs can be stored by discipline and exported as separate layout-preserving Japanese PDFs.
 
 ## Why it exists
 
@@ -71,7 +71,7 @@ When a command accepts `Title | content`, the part before the first `|` becomes 
 
 Use the PDF Library card to select a PDF and enter a research discipline. The original is stored under the active Vault at `Research Companion/PDF Library/<discipline>/`; an SHA-256 duplicate is not registered twice in the same project. Text PDFs use extracted text. Image-only pages are sent through RapidOCR's small ONNX Runtime CPU model when available, so an NVIDIA GPU is not required.
 
-Open a paper card to read page images on the left and source/translated text on the right. Translation and summarisation use the configured local agent; a summary is also saved as a Finding Memory and a Paper note in Obsidian. The original page is never reflowed, which keeps figures, tables, columns, and margins intact. This release is a layout-preserving reader; it does not export a newly typeset translated PDF. OCR quality for scanned documents depends on the source and CPU.
+Open a paper card and choose `レイアウト翻訳PDFを生成` to create a separate Japanese PDF. The configured local agent (Codex by default) translates detected text blocks, and the local PDF writer removes only those text objects and inserts the translation into the same rectangles. Figures, tables, columns, page dimensions, and formula-like text are retained from the original. The original PDF is never overwritten. Scanned pages use OCR regions when available; uncertain or missing OCR regions remain unchanged. Long translations are reduced to fit the source rectangle, so review the generated PDF. Summarisation still uses the configured agent and is saved as a Finding Memory and Paper note in Obsidian.
 
 ### 4. Browse the Obsidian projection
 

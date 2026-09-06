@@ -1,5 +1,7 @@
 # PDF feature (permissive/open-source CPU path)
 pypdf>=6.0,<7
 pypdfium2>=5.0,<6
+PyMuPDF>=1.24,<1.28
 rapidocr-onnxruntime>=1.4,<2
 onnxruntime>=1.20,<2
+Pillow>=10,<13

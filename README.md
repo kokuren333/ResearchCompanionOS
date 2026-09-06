@@ -17,7 +17,7 @@ Research Companion OSは、Codexなどのローカルエージェントと長期
 - Research State、Decision、Failure、Question、Evidence、Findingなどの構造化された知識
 - SQLite FTS5とローカル埋め込みを組み合わせた検索
 - プロジェクト、Memory、会話、関連リンクを辿れるObsidian出力
-- PDFを研究分野別にVaultへ保存するPaper Library、原文ページと翻訳を並べるReader、CPU OCRとAI要約
+- PDFを研究分野別にVaultへ保存し、原PDFを壊さずレイアウトを維持した日本語PDFを生成するPaper Library、CPU OCRとAI要約
 - `/` を入力した時点で候補と使い方を表示するスラッシュコマンド
 - Codex、Claude、その他の任意のローカルエージェントを指定ディレクトリで実行
 - Pythonバックエンドを同梱したTauri Windowsアプリ
