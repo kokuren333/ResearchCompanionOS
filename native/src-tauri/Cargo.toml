@@ -1,6 +1,6 @@
 [package]
 name = "research-companion-native"
-version = "0.1.0"
+version = "0.2.0"
 description = "Tauri desktop client for Research Companion OS"
 authors = ["Research Companion OS"]
 edition = "2021"
