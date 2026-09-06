@@ -67,13 +67,17 @@ When a command accepts `Title | content`, the part before the first `|` becomes 
 
 `Research OS` is deliberately separate from Chat. It contains project selection, creation and permanent deletion, Research State editing, Memory CRUD and filtering, hybrid search, state counts, Context Packet preview/copy, graph inspection, maintenance, Obsidian sync, and tagged-note import.
 
-### 3. Attach media and URLs
+### 4. Render Markdown, equations, and tables
+
+Agent answers are rendered as Markdown, including headings, lists, links, blockquotes, code blocks, and GitHub-style Markdown tables. LaTeX math is supported with inline delimiters such as `$E=mc^2$` and block delimiters such as `$$\int_0^1 x^2 dx$$` or `\[ ... \]`. The rendering libraries are bundled with the app, so this also works offline. Text inside code blocks is not treated as math.
+
+### 5. Attach media and URLs
 
 Use `＋ 画像/PDF` in the composer to attach PNG, JPEG, GIF, WebP, BMP, TIFF, SVG, or PDF files. Browser uploads are copied into the per-conversation application-data attachment directory. The Tauri build uses its native file picker. The application does not OCR, parse, convert, or rewrite the files; it gives the configured agent the attachment name, MIME type, and absolute local path in the prompt.
 
 Add a URL in the `URLを追加` field before sending. URLs written directly in the message are also detected. URLs are passed to the agent without being downloaded or interpreted by the application; whether they can be opened depends on the agent's network access and authentication. Attach a PDF and send `/summarize` or `/pdf-summary` to ask the agent for a Japanese research summary with claims, methods, evidence, limitations, and page references when available.
 
-### 4. Browse the Obsidian projection
+### 6. Browse the Obsidian projection
 
 Open the Vault folder in Obsidian and start at `Research Companion/Home.md`. The generated pages use standard `[[wiki links]]`; Dataview or another plugin is not required.
 
