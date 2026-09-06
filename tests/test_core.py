@@ -53,6 +53,21 @@ class ResearchCompanionCoreTests(unittest.TestCase):
         self.assertGreaterEqual(result["count"], 2)
         self.assertTrue((vault / "Projects" / "test-research" / "Project State.md").exists())
 
+    def test_chat_saves_transcript_and_explicit_insight(self):
+        vault = Path(self.temp.name) / "shared-vault"
+        self.store.update_settings({"vault_path": str(vault), "workspace_dir": self.temp.name})
+        result = self.store.chat({"project_id": self.project["id"], "message": "/remember SQLite should remain the machine source of truth"})
+        self.assertEqual(result["memory"]["type"], "note")
+        self.assertTrue(Path(result["transcript_path"]).exists())
+        self.assertTrue((vault / "Projects" / "test-research" / "Project State.md").exists())
+        conversation = self.store.conversation(result["conversation_id"])
+        self.assertEqual([m["role"] for m in conversation["messages"]], ["user", "assistant"])
+
+    def test_configured_agent_runs_in_selected_directory(self):
+        output, code = self.store._agent_command('python -c "print(\'agent-ok\')"', 'test prompt', self.temp.name, 30)
+        self.assertEqual(code, 0)
+        self.assertIn("agent-ok", output)
+
 
 if __name__ == "__main__":
     unittest.main()

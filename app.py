@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -26,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 DEFAULT_DB = ROOT / "research_companion.db"
+DEFAULT_VAULT = ROOT / "vault"
 NOW = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 MEMORY_TYPES = {
@@ -144,6 +146,20 @@ class ResearchStore:
                     id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, interval_seconds INTEGER NOT NULL,
                     last_run TEXT, next_run TEXT, enabled INTEGER DEFAULT 1
                 );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, project_id TEXT,
+                    workspace_dir TEXT DEFAULT '', agent_command TEXT DEFAULT '',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
+                );
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
+                    content TEXT NOT NULL, metadata_json TEXT DEFAULT '{}', created_at TEXT NOT NULL,
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+                );
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
                     memory_id UNINDEXED, title, content, type, project_id UNINDEXED
                 );
@@ -153,6 +169,23 @@ class ResearchStore:
                     ('job_weekly','weekly_cross_project_review',604800,NULL);
                 """
             )
+        DEFAULT_VAULT.mkdir(parents=True, exist_ok=True)
+        with self.connect() as db:
+            defaults = {
+                "vault_path": str(DEFAULT_VAULT),
+                "workspace_dir": str(ROOT),
+                "agent_command": "",
+                "agent_timeout": "180",
+            }
+            for key, value in defaults.items():
+                db.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)", (key, value, NOW()))
+        if not self.projects():
+            self.create_project({
+                "name": "Research Companion OS",
+                "description": "長期研究開発のためのローカル研究伴走基盤",
+                "current_objective": "最初の研究目標を定義する",
+                "next_actions": ["最初のDecisionまたはQuestionを記録する"],
+            })
 
     def _row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
@@ -414,6 +447,133 @@ class ResearchStore:
                 mp = mdir / f"{memory['id']}-{slug(memory['title'])}.md"; mp.write_text("\n".join(content), encoding="utf-8"); written.append(str(mp))
         return {"vault": str(vault_path), "written": written, "count": len(written)}
 
+    def settings(self) -> dict[str, str]:
+        with self.connect() as db:
+            return {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM settings")}
+
+    def update_settings(self, data: dict[str, Any]) -> dict[str, str]:
+        allowed = {"vault_path", "workspace_dir", "agent_command", "agent_timeout"}
+        with self.lock, self.connect() as db:
+            for key, value in data.items():
+                if key in allowed and value is not None:
+                    if key == "vault_path" and not str(value).strip(): value = str(DEFAULT_VAULT)
+                    if key == "workspace_dir" and not str(value).strip(): value = str(ROOT)
+                    db.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (key, str(value), NOW()))
+        current = self.settings()
+        Path(current["vault_path"]).expanduser().resolve().mkdir(parents=True, exist_ok=True)
+        return current
+
+    def create_conversation(self, data: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = data or {}
+        now = NOW(); conversation_id = data.get("id") or uid("chat")
+        project_id = data.get("project_id") or (self.projects()[0]["id"] if self.projects() else None)
+        item = (conversation_id, data.get("title") or "New research chat", project_id, data.get("workspace_dir", ""), data.get("agent_command", ""), now, now)
+        with self.lock, self.connect() as db:
+            db.execute("INSERT INTO conversations(id,title,project_id,workspace_dir,agent_command,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", item)
+        return self.conversation(conversation_id)  # type: ignore[return-value]
+
+    def conversation(self, conversation_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+            if not row: return None
+            item = dict(row)
+            item["messages"] = [dict(m) for m in db.execute("SELECT * FROM chat_messages WHERE conversation_id=? ORDER BY created_at", (conversation_id,)).fetchall()]
+            for message in item["messages"]: message["metadata"] = json_load(message.pop("metadata_json"), {})
+            return item
+
+    def conversations(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("SELECT c.*, (SELECT content FROM chat_messages m WHERE m.conversation_id=c.id ORDER BY m.created_at DESC LIMIT 1) AS last_message FROM conversations c ORDER BY c.updated_at DESC LIMIT ?", (max(1, min(limit, 200)),))]
+
+    def _save_chat_message(self, db: sqlite3.Connection, conversation_id: str, role: str, content: str, metadata: dict[str, Any] | None = None) -> None:
+        db.execute("INSERT INTO chat_messages(id,conversation_id,role,content,metadata_json,created_at) VALUES(?,?,?,?,?,?)", (uid("msg"), conversation_id, role, content, json.dumps(metadata or {}, ensure_ascii=False), NOW()))
+
+    def _agent_command(self, command: str, prompt: str, cwd: str, timeout: int) -> tuple[str, int]:
+        workdir = Path(cwd).expanduser().resolve()
+        if not workdir.exists() or not workdir.is_dir():
+            return f"作業ディレクトリが存在しません: {workdir}", 2
+        command = command.strip()
+        if not command:
+            return "エージェントコマンドが未設定です。右上の設定から、例: `codex exec` や `claude -p` を指定してください。", 0
+        # {prompt} is replaced with one safely quoted argument. Without it, the
+        # prompt is sent on stdin, which works with most CLI agents.
+        rendered = command
+        stdin = prompt
+        if "{prompt}" in command:
+            rendered = command.replace("{prompt}", subprocess.list2cmdline([prompt]))
+            stdin = ""
+        try:
+            proc = subprocess.run(rendered, cwd=str(workdir), input=stdin, text=True, capture_output=True, timeout=max(10, min(timeout, 900)), shell=True)
+        except subprocess.TimeoutExpired:
+            return f"エージェントが{timeout}秒以内に終了しませんでした。", 124
+        output = (proc.stdout or "").strip()
+        if proc.stderr:
+            output = (output + "\n\n[stderr]\n" + proc.stderr.strip()).strip()
+        return output or "エージェントから出力がありませんでした。", proc.returncode
+
+    def _chat_memory(self, project_id: str | None, user_message: str, assistant_message: str, conversation_id: str) -> dict[str, Any] | None:
+        text = f"{user_message}\n{assistant_message}"
+        explicit = user_message.strip().lower().startswith(("/remember", "/decision", "/failure", "/question", "/evidence", "/finding"))
+        signals = ("決定", "決め", "失敗", "原因", "結論", "知見", "覚えて", "重要", "次回", "decision", "failure", "lesson", "remember")
+        if not explicit and not any(signal in text.lower() for signal in signals):
+            return None
+        first = user_message.strip().splitlines()[0] if user_message.strip() else "Chat insight"
+        memory_type = "note"
+        for prefix, kind in (("/decision", "decision"), ("/failure", "failure"), ("/question", "question"), ("/evidence", "evidence"), ("/finding", "finding")):
+            if user_message.strip().lower().startswith(prefix):
+                memory_type = kind; first = user_message.strip()[len(prefix):].strip() or kind.title(); break
+        if user_message.strip().lower().startswith("/remember"):
+            first = user_message.strip()[9:].strip() or first
+        return self.create_memory({
+            "project_id": project_id, "type": memory_type, "title": first[:120],
+            "content": f"User: {user_message.strip()}\n\nAgent: {assistant_message.strip()}",
+            "source_type": "chat_message", "source_id": conversation_id,
+            "importance": .7 if explicit else .55, "confidence": .65,
+        })
+
+    def _write_conversation_projection(self, conversation_id: str) -> str:
+        settings = self.settings(); vault = Path(settings["vault_path"]).expanduser().resolve(); vault.mkdir(parents=True, exist_ok=True)
+        conversation = self.conversation(conversation_id)
+        if not conversation: raise ValueError("conversation not found")
+        directory = vault / "Conversations"; directory.mkdir(parents=True, exist_ok=True)
+        filename = f"{conversation_id}-{slug(conversation['title'])}.md"
+        lines = ["---", f"id: {conversation_id}", f"project_id: {conversation.get('project_id') or ''}", "tags: [research-companion, conversation]", "---", f"# {conversation['title']}", ""]
+        for message in conversation["messages"]:
+            lines += [f"## {message['role'].title()} — {message['created_at']}", "", message["content"], ""]
+        path = directory / filename; path.write_text("\n".join(lines), encoding="utf-8")
+        return str(path)
+
+    def chat(self, data: dict[str, Any]) -> dict[str, Any]:
+        message = str(data.get("message", "")).strip()
+        if not message: raise ValueError("message is required")
+        project_id = data.get("project_id") or (self.projects()[0]["id"] if self.projects() else None)
+        conversation_id = data.get("conversation_id")
+        conversation = self.conversation(conversation_id) if conversation_id else None
+        if not conversation:
+            conversation = self.create_conversation({"project_id": project_id, "title": message[:60]})
+            conversation_id = conversation["id"]
+        settings = self.settings()
+        workspace = str(data.get("workspace_dir") or conversation.get("workspace_dir") or settings["workspace_dir"])
+        command = str(data.get("agent_command") if data.get("agent_command") is not None else conversation.get("agent_command") or settings["agent_command"])
+        timeout = int(data.get("agent_timeout") or settings.get("agent_timeout", "180"))
+        context = self.compile_context(project_id, message, 8)["packet"] if project_id else ""
+        history = self.conversation(conversation_id)["messages"][-10:]
+        prompt = "You are the user's research/coding agent. Work in the supplied directory. Preserve provenance and do not invent facts.\n\nRESEARCH CONTEXT:\n" + context + "\n\nRECENT CHAT:\n" + "\n".join(f"{m['role']}: {m['content']}" for m in history) + f"\n\nUSER:\n{message}"
+        with self.lock, self.connect() as db:
+            self._save_chat_message(db, conversation_id, "user", message, {"workspace_dir": workspace})
+            title = message[:60] if conversation.get("title") == "New research chat" else conversation["title"]
+            db.execute("UPDATE conversations SET title=?,project_id=?,workspace_dir=?,agent_command=?,updated_at=? WHERE id=?", (title, project_id, workspace, command, NOW(), conversation_id))
+        assistant, exit_code = self._agent_command(command, prompt, workspace, timeout)
+        if exit_code != 0: assistant = f"Agent error (exit {exit_code})\n\n{assistant}"
+        with self.lock, self.connect() as db:
+            self._save_chat_message(db, conversation_id, "assistant", assistant, {"exit_code": exit_code, "workspace_dir": workspace, "agent_command": command})
+            db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (NOW(), conversation_id))
+        memory = self._chat_memory(project_id, message, assistant, conversation_id)
+        transcript = self._write_conversation_projection(conversation_id)
+        if project_id:
+            self.sync_obsidian(settings["vault_path"], project_id)
+        return {"conversation_id": conversation_id, "message": {"role": "assistant", "content": assistant, "exit_code": exit_code}, "memory": memory, "transcript_path": transcript, "context_used": bool(context), "settings": self.settings()}
+
     def jobs(self) -> list[dict[str, Any]]:
         with self.connect() as db:
             return [dict(r) for r in db.execute("SELECT * FROM jobs ORDER BY name")]
@@ -459,7 +619,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urlparse(self.path); path = parsed.path; q = parse_qs(parsed.query)
         try:
             if path == "/api/health": return self._send(200, {"ok": True, "service": "Research Companion OS", "time": NOW()})
+            if path == "/api/settings": return self._send(200, self.store.settings())
             if path == "/api/projects": return self._send(200, self.store.projects())
+            if path == "/api/conversations": return self._send(200, self.store.conversations())
+            if path.startswith("/api/conversations/"):
+                return self._send(200, self.store.conversation(path.rsplit("/", 1)[1]) or {"error": "not found"})
             if path.startswith("/api/projects/"):
                 project_id = path.split("/")[3] if path.endswith("/overview") else path.rsplit("/", 1)[1]
                 if path.endswith("/overview"): return self._send(200, self.store.overview(project_id))
@@ -483,6 +647,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urlparse(self.path).path; data = self._json()
         try:
             if path == "/api/projects": return self._send(201, self.store.create_project(data))
+            if path == "/api/conversations": return self._send(201, self.store.create_conversation(data))
+            if path == "/api/chat": return self._send(200, self.store.chat(data))
             if path == "/api/memories": return self._send(201, self.store.create_memory(data))
             if path == "/api/search": return self._send(200, {"results": self.store.search(data.get("query", ""), data.get("project_id"), data.get("intent", "recall"), int(data.get("limit", 12)))})
             if path == "/api/context/compile": return self._send(200, self.store.compile_context(data["project_id"], data.get("query", ""), int(data.get("limit", 12))))
@@ -496,6 +662,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         path = urlparse(self.path).path; data = self._json()
         try:
+            if path == "/api/settings": return self._send(200, self.store.update_settings(data))
             if path.startswith("/api/projects/"): return self._send(200, self.store.update_project(path.rsplit("/", 1)[1], data) or {"error": "not found"})
             return self._send(404, {"error": "not found"})
         except Exception as exc:

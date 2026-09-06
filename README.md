@@ -12,6 +12,10 @@ python app.py
 
 Open <http://127.0.0.1:8765>. The database is created as `research_companion.db` on first run. Use `--db` to place it elsewhere.
 
+The main experience is a ChatGPT-style chat. A shared Obsidian Vault is created automatically at `./vault` and every conversation is written to `vault/Conversations`; explicitly marked insights are also projected into the research memory folders. Use `/remember`, `/decision`, `/failure`, `/question`, `/evidence`, or `/finding` at the start of a message to save a durable insight. The Vault path can be changed in Settings.
+
+To run an existing local agent, open Settings and set its working directory and command. For example, set the directory to the project you want the agent to work in and use `codex exec {prompt}` or `claude -p {prompt}`. If `{prompt}` is present, the prompt is passed as one argument; otherwise it is sent over standard input. An empty command keeps the app in local memory/transcript mode.
+
 ## Implemented capabilities
 
 - Research State: objective, blockers, questions, hypotheses, assumptions, actions, risks

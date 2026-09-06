@@ -3,39 +3,26 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Research Companion OS</title>
+  <title>Research Companion</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div class="shell">
+  <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">◎</span><span>Research<br><b>Companion OS</b></span></div>
-      <div class="eyebrow">PROJECTS</div>
-      <div id="projects" class="project-list"></div>
-      <button id="new-project" class="ghost-button">＋ 新しいプロジェクト</button>
-      <div class="sidebar-foot"><span class="status-dot"></span> Local-first / SQLite</div>
+      <div class="brand"><span class="brand-icon">◎</span><span>Research<br><b>Companion</b></span></div>
+      <button id="new-chat" class="new-chat">＋ New chat</button>
+      <div class="sidebar-label">RECENT CHATS</div>
+      <div id="conversations" class="conversation-list"></div>
+      <div class="sidebar-bottom"><div class="local-state"><span class="online-dot"></span><span>Local-first</span><span class="local-detail">SQLite + Obsidian</span></div><button id="settings-button" class="settings-link">⚙ Settings</button></div>
     </aside>
-    <main class="main">
-      <header class="topbar">
-        <div><div class="eyebrow">RESEARCH WORKSPACE</div><h1 id="project-title">Loading…</h1></div>
-        <div class="top-actions"><button id="context-button" class="primary-button">Context Packet</button><button id="maintenance-button" class="ghost-button">Maintenance</button></div>
-      </header>
-      <section id="empty" class="empty-state hidden"><h2>研究を始める</h2><p>最初のプロジェクトを作成して、判断・失敗・問いを記録しましょう。</p><button id="empty-new" class="primary-button">プロジェクトを作成</button></section>
-      <div id="workspace" class="hidden">
-        <section class="stats" id="stats"></section>
-        <section class="hero-grid">
-          <article class="card state-card"><div class="card-head"><div><span class="eyebrow">PROJECT STATE</span><h2>いまの研究状態</h2></div><button id="edit-state" class="icon-button" title="編集">✎</button></div><div class="objective"><span class="label">CURRENT OBJECTIVE</span><p id="objective">—</p></div><div class="state-columns"><div><span class="label">BLOCKERS</span><ul id="blockers"></ul></div><div><span class="label">NEXT ACTIONS</span><ul id="actions"></ul></div></div></article>
-          <article class="card capture-card"><div class="card-head"><div><span class="eyebrow">MEMORY ENCODER</span><h2>記憶を記録</h2></div><span class="pill">provenance required</span></div><form id="memory-form"><div class="form-row"><label>Type<select id="memory-type"><option value="observation">Observation</option><option value="decision">Decision</option><option value="failure">Failure</option><option value="question">Question</option><option value="hypothesis">Hypothesis</option><option value="evidence">Evidence</option><option value="finding">Finding</option><option value="experiment">Experiment</option><option value="procedure">Procedure</option><option value="idea">Idea</option><option value="note">Note</option></select></label><label>Source<select id="source-type"><option value="direct_user_statement">User statement</option><option value="direct_observation">Observation</option><option value="code_output">Code output</option><option value="experiment_result">Experiment result</option><option value="external_verified_source">Verified source</option><option value="agent_inference">Agent inference</option></select></label></div><label>Title<input id="memory-title" required placeholder="例: SQLiteを正本にする" /></label><label>Content<textarea id="memory-content" required placeholder="何が分かったか、なぜ重要か、再利用時の注意点…"></textarea></label><div class="form-row"><label>Importance<input id="importance" type="range" min="0" max="1" step=".05" value=".65" /></label><label>Confidence<input id="confidence" type="range" min="0" max="1" step=".05" value=".75" /></label></div><button class="primary-button" type="submit">記憶を保存する</button></form></article>
-        </section>
-        <section class="lower-grid">
-          <article class="card search-card"><div class="card-head"><div><span class="eyebrow">HYBRID RETRIEVAL</span><h2>思い出す</h2></div><select id="intent"><option value="recall">Recall</option><option value="failure">Failure / Debug</option><option value="decision">Decision / Planning</option><option value="evidence">Evidence</option></select></div><form id="search-form" class="search-form"><input id="search-query" placeholder="問い、症状、過去の判断を検索…" /><button class="primary-button" type="submit">検索</button></form><div id="results" class="results"><div class="muted">BM25 + local embedding + graph + temporal score</div></div></article>
-          <article class="card compiler-card"><div class="card-head"><div><span class="eyebrow">CONTEXT COMPILER</span><h2>Agent Context Packet</h2></div><button id="copy-context" class="icon-button" title="コピー">⧉</button></div><p class="muted">Research Stateと関連Memoryを、LLMへ渡せる小さな引き継ぎに変換します。</p><pre id="context-preview">Context Packetを生成するとここに表示されます。</pre><button id="compile-button" class="secondary-button">コンパイルする</button></article>
-          <article class="card activity-card"><div class="card-head"><div><span class="eyebrow">MEMORY RUNTIME</span><h2>最近の記憶</h2></div><button id="obsidian-button" class="secondary-button">Obsidianへ同期</button></div><div id="activity"></div></article>
-          <article class="card graph-card"><div class="card-head"><div><span class="eyebrow">EVIDENCE GRAPH</span><h2>関係性</h2></div></div><div id="graph"></div></article>
-        </section>
-      </div>
+    <main class="chat-main">
+      <header class="chat-header"><div class="mobile-brand">Research Companion</div><div class="project-select-wrap"><span class="header-label">PROJECT</span><select id="project-select"></select></div><button id="header-settings" class="round-button" title="Settings">⚙</button></header>
+      <section id="welcome" class="welcome"><div class="welcome-mark">◎</div><h1>What are you researching?</h1><p>Your decisions, failures, questions, and findings accumulate in one shared Obsidian Vault.</p><div class="starter-grid"><button data-starter="このプロジェクトの現在の状態を整理して、次に何を検証すべきか提案して">研究状態を整理する<span>State · Questions · Next action</span></button><button data-starter="過去の失敗と関連する知見を探して、再発防止策をまとめて">過去の失敗を探す<span>Failure · Root cause · Lessons</span></button><button data-starter="このテーマについて、現在の仮説と不足している証拠を整理して">仮説と証拠を整理する<span>Hypothesis · Evidence · Gaps</span></button></div></section>
+      <section id="messages" class="messages hidden"></section>
+      <div class="composer-wrap"><div id="agent-status" class="agent-status"></div><form id="chat-form" class="composer"><textarea id="message" rows="1" placeholder="Message your research companion…"></textarea><button id="send" type="submit" title="Send">↑</button></form><div class="composer-hint"><span>Enterで送信 · Shift+Enterで改行</span><span>/remember で知見を明示保存</span></div></div>
     </main>
   </div>
+  <dialog id="settings-dialog"><form method="dialog" id="settings-form"><div class="dialog-head"><div><div class="sidebar-label">LOCAL CONFIGURATION</div><h2>Settings</h2></div><button class="close-button" value="cancel">×</button></div><p class="dialog-note">エージェントは指定したディレクトリを作業場所として実行されます。コマンドが空ならMemory保存モードになります。</p><label>Obsidian Vault path<input id="vault-path" placeholder="空欄なら ./vault" /></label><label>Agent working directory<input id="workspace-dir" placeholder="例: D:\\projects\\my-research" /></label><label>Agent command<input id="agent-command" placeholder="例: codex exec {prompt} / claude -p {prompt}" /></label><div class="command-help"><code>{prompt}</code> を含めるとプロンプトを引数として渡します。含めない場合は標準入力へ渡します。</div><label>Timeout (seconds)<input id="agent-timeout" type="number" min="10" max="900" /></label><div class="dialog-actions"><button class="secondary-button" value="cancel">Cancel</button><button id="save-settings" class="primary-button" value="default">Save settings</button></div></form></dialog>
   <div id="toast" class="toast"></div>
   <script src="/app.js"></script>
 </body>
