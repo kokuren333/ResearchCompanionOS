@@ -955,11 +955,14 @@ class ResearchStore:
                 return {"run_id": run_id, "status": "not_found", "output": ""}
             stdout = bytes(state.get("stdout", b""))
             stderr = bytes(state.get("stderr", b""))
+            # Most CLI agents write progress and tool activity to stderr. Keep
+            # it separate from the answer, but expose it to the live status UI.
             return {
                 "run_id": run_id,
                 "status": "running" if active else state.get("status", "finished"),
                 "output": stdout.decode("utf-8", errors="replace"),
                 "stderr": stderr.decode("utf-8", errors="replace"),
+                "progress": stderr.decode("utf-8", errors="replace"),
                 "exit_code": state.get("exit_code"),
             }
 
@@ -1004,11 +1007,26 @@ class ResearchStore:
         try:
             # Codex expects UTF-8 on stdin. Keep the transport byte-oriented
             # instead of letting Windows choose the active code page.
-            proc = subprocess.Popen(rendered, cwd=str(workdir), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-            with self.process_lock:
-                self.active_processes[run_id] = proc
+            popen_options: dict[str, Any] = {
+                "cwd": str(workdir),
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "shell": True,
+            }
+            if os.name == "nt":
+                # shell=True launches cmd.exe for configured command strings.
+                # CREATE_NO_WINDOW prevents that helper console from flashing
+                # whenever an agent is started from the desktop app.
+                popen_options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                popen_options["startupinfo"] = startupinfo
+            proc = subprocess.Popen(rendered, **popen_options)
             with self.process_lock:
                 self.run_states[run_id] = {"status": "running", "stdout": bytearray(), "stderr": bytearray(), "exit_code": None}
+                self.active_processes[run_id] = proc
 
             def drain(stream: Any, key: str) -> None:
                 try:

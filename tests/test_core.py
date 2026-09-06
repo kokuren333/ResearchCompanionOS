@@ -163,6 +163,17 @@ class ResearchCompanionCoreTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(status["status"], "finished")
         self.assertIn("stream-ok", status["output"])
+        self.assertIn("progress", status)
+
+    def test_agent_run_status_exposes_stderr_as_progress(self):
+        output, code = self.store._agent_command_with_id(
+            'python -c "import sys; print(\'working\', file=sys.stderr); print(\'answer\')"',
+            "test prompt", self.temp.name, 30, "run_progress"
+        )
+        status = self.store.run_status("run_progress")
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "answer")
+        self.assertIn("working", status["progress"])
 
     def test_successful_agent_stderr_is_not_chat_content(self):
         output, code = self.store._agent_command_with_id(

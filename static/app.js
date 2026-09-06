@@ -80,6 +80,8 @@ async function addBrowserMedia(event){try{for(const file of event.target.files||
 function addUrl(){const input=$('url-input');const value=input.value.trim();if(!value)return;try{const url=new URL(value);if(!['http:','https:'].includes(url.protocol))throw new Error('http/https URLを指定してください');if(!state.pendingUrls.includes(url.href))state.pendingUrls.push(url.href);input.value='';renderAttachmentPreview()}catch(err){toast(err.message||'URLの形式が不正です')}}
 let activeRunId=null;
 async function cancelAgent(){if(!activeRunId)return;try{await api('/api/chat/cancel',{method:'POST',body:JSON.stringify({run_id:activeRunId})});toast('Agentを終了しています…')}catch(err){toast(err.message)}}
+function cleanProgress(value){return String(value||'').replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g,'').replace(/\r/g,'\n').split('\n').map(line=>line.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,'').trim()).filter(Boolean).slice(-5).join('\n').slice(-700)}
+function renderAgentProgress(status,phase='エージェントを実行中…'){const progress=cleanProgress(status?.progress||status?.stderr);$('agent-status').textContent=progress?`${phase}\n${progress}`:phase}
 async function sendMessage(e){
   e.preventDefault();
   const input=$('message');
@@ -89,14 +91,15 @@ async function sendMessage(e){
   if(!message&&!attachments.length&&!urls.length)return;
   input.value='';input.style.height='auto';$('command-suggestions').classList.add('hidden');
   state.pendingAttachments=[];state.pendingUrls=[];renderAttachmentPreview();
-  $('send').disabled=true;$('cancel-agent').hidden=false;$('agent-status').textContent='Research Companion is working…';
+  $('send').disabled=true;$('cancel-agent').hidden=false;renderAgentProgress(null,'準備中…');
   activeRunId=globalThis.crypto?.randomUUID?.()||`run-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const runId=activeRunId;
-  const poll=setInterval(async()=>{try{const status=await api('/api/runs/'+runId);if(status.output)$('agent-status').textContent=`Research Companion is working…\n${status.output.slice(-500)}`}catch(_){}} ,700);
+  const poll=setInterval(async()=>{try{const status=await api('/api/runs/'+runId);if(status.status==='running')renderAgentProgress(status,'エージェントを実行中…')}catch(_){}} ,500);
   const displayMessage=message||'添付ファイル／URLを確認してください。';
   try{
     if(!state.conversation){state.conversation=await api('/api/conversations',{method:'POST',body:JSON.stringify({project_id:selectedProject(),title:displayMessage.slice(0,60)})});state.conversations=[state.conversation,...state.conversations];renderConversations()}
     const user={role:'user',content:displayMessage,metadata:{attachments,urls}};state.conversation.messages=[...(state.conversation.messages||[]),user];renderMessages();
+    renderAgentProgress(null,'エージェントを起動中…');
     const result=await api('/api/chat',{method:'POST',body:JSON.stringify({conversation_id:state.conversation.id,project_id:selectedProject(),message:displayMessage,attachments,urls,run_id:runId,workspace_dir:state.settings.workspace_dir,agent_command:state.settings.agent_command,agent_timeout:state.settings.agent_timeout})});
     state.conversation=await api('/api/conversations/'+result.conversation_id);state.conversations=await api('/api/conversations');renderConversations();renderMessages();
     if(result.memory)toast('知識をVaultへ保存しました');else toast('会話をVaultへ保存しました')

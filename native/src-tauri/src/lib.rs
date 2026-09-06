@@ -41,9 +41,11 @@ fn backend_is_running(port: u16) -> bool {
 fn terminate_child(child: &mut Child) {
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .output();
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &child.id().to_string(), "/T", "/F"]);
+        command.creation_flags(0x08000000);
+        let _ = command.output();
     }
     #[cfg(not(windows))]
     {
