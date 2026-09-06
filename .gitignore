@@ -1,0 +1,6 @@
+research_companion.db
+smoke.db
+*.db-shm
+*.db-wal
+__pycache__/
+tests/__pycache__/
