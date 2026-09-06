@@ -1,7 +1,8 @@
 """Research Companion OS - local-first research memory server.
 
-The implementation deliberately uses only the Python standard library. SQLite is
-the machine source of truth; Obsidian is a generated, human-readable projection.
+SQLite is the machine source of truth; Obsidian is a generated, human-readable
+projection. PDF extraction/rendering and CPU OCR are provided by the optional
+PDF stack in requirements.txt (the native build bundles it).
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ import os
 import re
 import sqlite3
 import subprocess
+import base64
+import shutil
 import sys
 import threading
 import time
@@ -23,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+from pdf_library import copy_into_library, inspect_pdf, ocr_page, render_page, safe_name
 
 
 ROOT = Path(__file__).resolve().parent
@@ -70,6 +75,7 @@ APP_REQUEST_VALUE = "desktop"
 PROJECTION_DIR = "Research Companion"
 VAULT_HOME = "Home.md"
 VAULT_ROOT_GUIDE = "Research Companion.md"
+AGENT_MEMORY_BLOCK = re.compile(r"\[\[memory\]\]\s*(\{.*?\})\s*\[\[/memory\]\]", re.IGNORECASE | re.DOTALL)
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -197,6 +203,22 @@ class ResearchStore:
                     content TEXT NOT NULL, metadata_json TEXT DEFAULT '{}', created_at TEXT NOT NULL,
                     FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS pdf_documents (
+                    id TEXT PRIMARY KEY, project_id TEXT, title TEXT NOT NULL,
+                    original_filename TEXT NOT NULL, stored_path TEXT NOT NULL,
+                    discipline TEXT NOT NULL DEFAULT 'Uncategorized', author TEXT DEFAULT '',
+                    page_count INTEGER NOT NULL DEFAULT 0, file_size INTEGER NOT NULL DEFAULT 0,
+                    sha256 TEXT NOT NULL, extracted_text TEXT DEFAULT '', summary TEXT DEFAULT '',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
+                );
+                CREATE TABLE IF NOT EXISTS pdf_pages (
+                    id TEXT PRIMARY KEY, pdf_id TEXT NOT NULL, page_number INTEGER NOT NULL,
+                    text TEXT DEFAULT '', translation TEXT DEFAULT '', translation_status TEXT DEFAULT 'not_started',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(pdf_id, page_number),
+                    FOREIGN KEY(pdf_id) REFERENCES pdf_documents(id) ON DELETE CASCADE
+                );
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
                     memory_id UNINDEXED, title, content, type, project_id UNINDEXED
                 );
@@ -261,6 +283,174 @@ class ResearchStore:
     def projects(self) -> list[dict[str, Any]]:
         with self.connect() as db:
             return [self._row(row) for row in db.execute("SELECT * FROM projects ORDER BY updated_at DESC")]
+
+    def delete_project(self, project_id: str) -> dict[str, Any] | None:
+        """Permanently remove one project and its private research records.
+
+        Archiving is represented by the existing ``status=archived`` update.
+        This destructive operation is deliberately separate and returns counts
+        so the UI can show exactly what will disappear before confirmation.
+        """
+        with self.lock, self.connect() as db:
+            project = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+            if not project:
+                return None
+            project_count = int(db.execute("SELECT COUNT(*) FROM projects").fetchone()[0])
+            if project_count <= 1:
+                raise ValueError("最後のプロジェクトは削除できません")
+            memory_ids = [r[0] for r in db.execute("SELECT id FROM memories WHERE project_id=?", (project_id,)).fetchall()]
+            conversation_ids = [r[0] for r in db.execute("SELECT id FROM conversations WHERE project_id=?", (project_id,)).fetchall()]
+            pdf_rows = db.execute("SELECT id,stored_path FROM pdf_documents WHERE project_id=?", (project_id,)).fetchall()
+            pdf_ids = [r[0] for r in pdf_rows]
+            for conversation_id in conversation_ids:
+                db.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+            for memory_id in memory_ids:
+                db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+            db.execute("DELETE FROM pdf_documents WHERE project_id=?", (project_id,))
+            db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        library_root = (Path(self.settings()["vault_path"]).expanduser().resolve() / PROJECTION_DIR / "PDF Library").resolve()
+        for row in pdf_rows:
+            path = Path(row[1]).expanduser().resolve()
+            if library_root in path.parents and path.is_file():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        return {"project_id": project_id, "name": project["name"], "memories": len(memory_ids), "conversations": len(conversation_ids), "pdfs": len(pdf_ids)}
+
+    def pdfs(self, project_id: str | None = None, limit: int = 1000) -> list[dict[str, Any]]:
+        clauses, args = [], []
+        if project_id:
+            clauses.append("project_id=?"); args.append(project_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.connect() as db:
+            rows = db.execute(f"SELECT id,project_id,title,original_filename,stored_path,discipline,author,page_count,file_size,sha256,summary,created_at,updated_at FROM pdf_documents{where} ORDER BY updated_at DESC LIMIT ?", (*args, max(1, min(int(limit), 100000)))).fetchall()
+            return [dict(row) for row in rows]
+
+    def pdf(self, pdf_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM pdf_documents WHERE id=?", (pdf_id,)).fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            item["pages"] = [dict(page) for page in db.execute("SELECT id,page_number,text,translation,translation_status,created_at,updated_at FROM pdf_pages WHERE pdf_id=? ORDER BY page_number", (pdf_id,)).fetchall()]
+            return item
+
+    def _pdf_path(self, pdf_id: str) -> Path:
+        with self.connect() as db:
+            row = db.execute("SELECT stored_path FROM pdf_documents WHERE id=?", (pdf_id,)).fetchone()
+        if not row:
+            raise ValueError("PDFが見つかりません")
+        path = Path(row[0]).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError("保存済みPDFが見つかりません。Vaultの場所を確認してください")
+        return path
+
+    def import_pdf(self, data: dict[str, Any]) -> dict[str, Any]:
+        project_id = data.get("project_id") or (self.projects()[0]["id"] if self.projects() else None)
+        if project_id and not self.project(project_id):
+            raise ValueError("project not found")
+        source_path: Path | None = None
+        temporary_path: Path | None = None
+        try:
+            if data.get("path"):
+                source_path = Path(str(data["path"])).expanduser().resolve()
+            elif data.get("data_base64"):
+                raw = str(data["data_base64"])
+                if "," in raw and raw.lower().startswith("data:"):
+                    raw = raw.split(",", 1)[1]
+                temporary_path = Path(self.db_path).resolve().parent / f".pdf-upload-{uuid.uuid4().hex}.pdf"
+                temporary_path.write_bytes(base64.b64decode(raw, validate=True))
+                source_path = temporary_path
+            else:
+                raise ValueError("PDFファイルを選択してください")
+            info = inspect_pdf(source_path)
+            ocr_pages: list[int] = []
+            if data.get("ocr", True):
+                for page_number, text in enumerate(info["pages"], 1):
+                    if text:
+                        continue
+                    try:
+                        recovered = ocr_page(source_path, page_number)
+                    except RuntimeError:
+                        recovered = ""
+                    if recovered:
+                        info["pages"][page_number - 1] = recovered
+                        ocr_pages.append(page_number)
+                info["text"] = "\n\n".join(f"[Page {index + 1}]\n{text}" for index, text in enumerate(info["pages"]) if text)
+            with self.connect() as db:
+                duplicate = db.execute("SELECT id FROM pdf_documents WHERE sha256=? AND (project_id=? OR (? IS NULL AND project_id IS NULL)) LIMIT 1", (info["sha256"], project_id, project_id)).fetchone()
+            if duplicate:
+                return {"duplicate": True, "document": self.pdf(duplicate[0])}
+            pdf_id = uid("pdf")
+            discipline = str(data.get("discipline") or "Uncategorized").strip()[:80] or "Uncategorized"
+            vault = Path(self.settings()["vault_path"]).expanduser().resolve()
+            stored_path = copy_into_library(source_path, vault, pdf_id, discipline)
+            title = str(data.get("title") or info["title"] or source_path.stem).strip()[:240] or source_path.stem
+            now = NOW()
+            with self.lock, self.connect() as db:
+                db.execute("INSERT INTO pdf_documents(id,project_id,title,original_filename,stored_path,discipline,author,page_count,file_size,sha256,extracted_text,summary,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (pdf_id, project_id, title, source_path.name, str(stored_path), discipline, info["author"], info["page_count"], info["file_size"], info["sha256"], info["text"], "", now, now))
+                for page_number, text in enumerate(info["pages"], 1):
+                    db.execute("INSERT INTO pdf_pages(id,pdf_id,page_number,text,created_at,updated_at) VALUES(?,?,?,?,?,?)", (uid("pdfpage"), pdf_id, page_number, text, now, now))
+            return {"duplicate": False, "ocr_pages": ocr_pages, "document": self.pdf(pdf_id)}
+        finally:
+            if temporary_path and temporary_path.is_file():
+                temporary_path.unlink()
+
+    def delete_pdf(self, pdf_id: str) -> bool:
+        with self.lock, self.connect() as db:
+            row = db.execute("SELECT stored_path FROM pdf_documents WHERE id=?", (pdf_id,)).fetchone()
+            if not row:
+                return False
+            path = Path(row[0]).expanduser().resolve()
+            vault = Path(self.settings()["vault_path"]).expanduser().resolve()
+            library_root = (vault / PROJECTION_DIR / "PDF Library").resolve()
+            db.execute("DELETE FROM pdf_documents WHERE id=?", (pdf_id,))
+        if library_root in path.parents and path.is_file():
+            path.unlink()
+        return True
+
+    def summarize_pdf(self, pdf_id: str) -> dict[str, Any]:
+        document = self.pdf(pdf_id)
+        if not document:
+            raise ValueError("PDFが見つかりません")
+        text = document.get("extracted_text", "").strip()
+        if not text:
+            raise ValueError("文字を抽出できないPDFです。画像PDFにはOCRが必要です")
+        settings = self.settings()
+        prompt = "You are a careful research-paper assistant. Summarize the supplied PDF text in Japanese. " \
+            "Separate confirmed claims, methods, limitations, and practical implications. Do not invent details. " \
+            "Return concise Markdown with headings and preserve page references when visible.\n\nPDF:\n" + text[:60000]
+        output, code = self._agent_command_with_id(settings["agent_command"], prompt, settings["workspace_dir"], int(settings.get("agent_timeout", "180")), uid("pdfsummary"))
+        if code != 0:
+            raise ValueError(f"要約エージェントが失敗しました (exit {code})\n{output[-1200:]}")
+        now = NOW()
+        with self.lock, self.connect() as db:
+            db.execute("UPDATE pdf_documents SET summary=?,updated_at=? WHERE id=?", (output.strip(), now, pdf_id))
+        memory = self.create_memory({"project_id": document.get("project_id"), "type": "finding", "title": f"PDF要約: {document['title']}", "content": output.strip(), "source_type": "pdf_summary", "source_id": pdf_id, "importance": .75, "confidence": .65, "metadata": {"pdf_id": pdf_id, "page_count": document["page_count"]}})
+        return {"document": self.pdf(pdf_id), "memory": memory}
+
+    def translate_pdf_page(self, pdf_id: str, page_number: int) -> dict[str, Any]:
+        document = self.pdf(pdf_id)
+        if not document:
+            raise ValueError("PDFが見つかりません")
+        page = next((page for page in document["pages"] if page["page_number"] == page_number), None)
+        if not page:
+            raise ValueError("ページ番号が範囲外です")
+        if not page["text"].strip():
+            now = NOW()
+            with self.connect() as db:
+                db.execute("UPDATE pdf_pages SET translation_status=?,updated_at=? WHERE pdf_id=? AND page_number=?", ("needs_ocr", now, pdf_id, page_number))
+            raise ValueError("このページは画像PDFのため文字を抽出できません。CPU OCRまたは外部OCRを設定してください")
+        settings = self.settings()
+        prompt = "Translate the following research PDF page from English to Japanese. Preserve equations, citations, names, and uncertainty. Return only the translation.\n\n" + page["text"][:24000]
+        output, code = self._agent_command_with_id(settings["agent_command"], prompt, settings["workspace_dir"], int(settings.get("agent_timeout", "180")), uid("pdftranslate"))
+        if code != 0:
+            raise ValueError(f"翻訳エージェントが失敗しました (exit {code})\n{output[-1200:]}")
+        now = NOW()
+        with self.lock, self.connect() as db:
+            db.execute("UPDATE pdf_pages SET translation=?,translation_status=?,updated_at=? WHERE pdf_id=? AND page_number=?", (output.strip(), "translated", now, pdf_id, page_number))
+        return {"pdf_id": pdf_id, "page_number": page_number, "translation": output.strip(), "translation_status": "translated"}
 
     def create_project(self, data: dict[str, Any]) -> dict[str, Any]:
         project_id = data.get("id") or uid("proj")
@@ -342,7 +532,7 @@ class ResearchStore:
             clauses.append("state=?"); args.append(state)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.connect() as db:
-            rows = db.execute(f"SELECT * FROM memories{where} ORDER BY last_accessed DESC LIMIT ?", (*args, max(1, min(limit, 500)))).fetchall()
+            rows = db.execute(f"SELECT * FROM memories{where} ORDER BY last_accessed DESC LIMIT ?", (*args, max(1, min(limit, 100000)))).fetchall()
             result = []
             for row in rows:
                 item = dict(row); item["metadata"] = json_load(item.pop("metadata_json"), {}); result.append(item)
@@ -546,18 +736,33 @@ class ResearchStore:
         previous_files = previous_manifest.get("files", {}) if isinstance(previous_manifest, dict) else {}
         projects = [self.project(project_id)] if project_id else self.projects()
         all_projects = [p for p in self.projects() if p]
-        all_memories = self.memories(limit=500)
-        all_conversations = [self.conversation(c["id"]) or c for c in self.conversations(limit=200)]
+        all_memories = self.memories(limit=100000)
+        all_conversations = [self.conversation(c["id"]) or c for c in self.conversations(limit=100000)]
+        all_pdfs = self.pdfs(limit=100000)
         written: list[str] = []
         # A project-scoped sync must not delete projections belonging to other
         # projects. A full sync is the cleanup boundary for the whole Vault.
         current_files: dict[str, str] = dict(previous_files) if project_id else {}
+        conflicts: list[str] = []
 
         def write_projection(path: Path, text: str) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text.rstrip() + "\n", encoding="utf-8")
+            normalized = text.rstrip() + "\n"
+            path_key = str(path)
+            if path.is_file() and path_key in previous_files:
+                current_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+                if current_hash != previous_files[path_key]:
+                    # Never destroy a hand-edited projection. Keep the stale
+                    # generated page and put the fresh projection beside it.
+                    update_path = path.with_name(f"{path.stem} (Research Companion update){path.suffix}")
+                    if not update_path.is_file() or update_path.read_text(encoding="utf-8") != normalized:
+                        update_path.write_text(normalized, encoding="utf-8")
+                    current_files[path_key] = previous_files[path_key]
+                    conflicts.append(str(path))
+                    return
+            path.write_text(normalized, encoding="utf-8")
             written.append(str(path))
-            current_files[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+            current_files[path_key] = hashlib.sha256(path.read_bytes()).hexdigest()
 
         project_paths = {
             p["id"]: f"{PROJECTION_DIR}/Projects/{slug(p['name'])}/Project Overview"
@@ -571,6 +776,10 @@ class ResearchStore:
         conversation_paths = {
             c["id"]: f"{PROJECTION_DIR}/Conversations/{self._conversation_filename(c)[:-3]}"
             for c in all_conversations
+        }
+        pdf_paths = {
+            pdf["id"]: f"{PROJECTION_DIR}/Projects/{slug(next((p['name'] for p in all_projects if p['id'] == pdf.get('project_id')), 'Uncategorized'))}/Papers/{safe_name(pdf.get('discipline', 'Uncategorized'), 'Uncategorized')}/{pdf['id']}-{safe_name(pdf['title'])}"
+            for pdf in all_pdfs if pdf.get("project_id") in project_paths
         }
 
         # A vault landing page explains the generated structure without relying
@@ -603,6 +812,7 @@ class ResearchStore:
             pdir = vault_path / PROJECTION_DIR / "Projects" / pslug
             project_memories = [m for m in all_memories if m.get("project_id") == project["id"]]
             project_conversations = [c for c in all_conversations if c.get("project_id") == project["id"]]
+            project_pdfs = [pdf for pdf in all_pdfs if pdf.get("project_id") == project["id"]]
             overview_lines = [
                 "<!-- Generated by Research Companion. Do not edit this file directly. -->",
                 "---", f"id: {project['id']}", f"status: {project['status']}", f"updated_at: {project['updated_at']}", "tags: [research-companion, project]", "type: project", "---",
@@ -623,6 +833,11 @@ class ResearchStore:
             overview_lines += ["", "## Conversations", ""]
             for conversation in project_conversations[:20]:
                 overview_lines.append(f"- [[{conversation_paths[conversation['id']]}|{conversation['title']}]]")
+            overview_lines += ["", "## Papers", ""]
+            if project_pdfs:
+                overview_lines.extend(f"- [[{pdf_paths[pdf['id']]}|{pdf['title']}]] — {pdf['discipline']} · {pdf['page_count']} pages" for pdf in project_pdfs if pdf["id"] in pdf_paths)
+            else:
+                overview_lines.append("- まだPDFがありません。管理画面のPDF Libraryから追加できます。")
             write_projection(pdir / "Project Overview.md", "\n".join(overview_lines))
             # Keep the old path as a readable compatibility link for existing
             # users who bookmarked the original projection.
@@ -651,7 +866,7 @@ class ResearchStore:
                         related = self.memory(related_id)
                         related_links.append(f"- [[{memory_paths[related_id]}|{related['title'] if related else related_id}]] — {edge['relation']}")
                 knowledge_links = [f"- Project: [[{project_paths[project['id']]}|{project['name']}]]"]
-                source_conversation = conversation_paths.get(memory.get("source_id")) if memory.get("source_type") in {"chat_message", "slash_command"} else None
+                source_conversation = conversation_paths.get(memory.get("source_id")) if memory.get("source_type") in {"chat_message", "slash_command", "agent_decided"} else None
                 if source_conversation:
                     knowledge_links.append(f"- Source conversation: [[{source_conversation}|open conversation]]")
                 if related_links:
@@ -665,6 +880,17 @@ class ResearchStore:
                 filename = memory_paths[memory["id"]].rsplit("/", 1)[-1]
                 write_projection(pdir / "Memory" / memory["type"] / f"{filename}.md", "\n".join(content))
 
+            for pdf in project_pdfs:
+                pdf_note = [
+                    "<!-- Generated by Research Companion. Do not edit this file directly. -->",
+                    "---", f"id: {pdf['id']}", f"project_id: {project['id']}", f"discipline: {pdf['discipline']}", f"page_count: {pdf['page_count']}", "tags: [research-companion, paper]", "type: paper", "---",
+                    f"# {pdf['title']}", "", f"- Project: [[{project_paths[project['id']]}|{project['name']}]]", f"- Original filename: `{pdf['original_filename']}`", f"- Stored PDF: `{pdf['stored_path']}`", "",
+                    "## Summary", "", pdf.get("summary") or "まだ要約されていません。アプリのPDF Libraryから要約を実行してください。", "",
+                    "## Reading notes", "", "このページはPDFのメタデータと要約を保持する投影です。原文ページと翻訳はアプリのPDF Readerで確認してください。",
+                ]
+                pdf_filename = pdf_paths[pdf["id"]].rsplit("/", 1)[-1]
+                write_projection(pdir / "Papers" / safe_name(pdf.get("discipline", "Uncategorized"), "Uncategorized") / f"{pdf_filename}.md", "\n".join(pdf_note))
+
         # Transcripts are retained, but they now link back into the knowledge
         # graph and list any durable memories created from the conversation.
         for conversation in all_conversations:
@@ -677,7 +903,7 @@ class ResearchStore:
             ]
             if conversation.get("project_id") in project_paths:
                 lines.append(f"- [[{project_paths[conversation['project_id']]}|Project Overview]]")
-            conversation_memories = [m for m in all_memories if m.get("source_id") == conversation["id"] and m.get("source_type") in {"chat_message", "slash_command"}]
+            conversation_memories = [m for m in all_memories if m.get("source_id") == conversation["id"] and m.get("source_type") in {"chat_message", "slash_command", "agent_decided"}]
             if conversation_memories:
                 lines += ["", "## Durable knowledge", ""]
                 lines.extend(f"- [[{memory_paths[m['id']]}|{m['title']}]]" for m in conversation_memories if m["id"] in memory_paths)
@@ -697,7 +923,7 @@ class ResearchStore:
             except OSError:
                 continue
         manifest_path.write_text(json.dumps({"version": 2, "files": current_files}, ensure_ascii=False, indent=2), encoding="utf-8")
-        return {"vault": str(vault_path), "written": written, "removed": removed, "count": len(written)}
+        return {"vault": str(vault_path), "written": written, "removed": removed, "conflicts": conflicts, "count": len(written)}
 
     def import_obsidian(self, vault: str, project_id: str | None = None) -> dict[str, Any]:
         """Import only user-authored, explicitly tagged notes from the Vault."""
@@ -766,6 +992,8 @@ class ResearchStore:
 
     def update_settings(self, data: dict[str, Any]) -> dict[str, str]:
         allowed = {"vault_path", "workspace_dir", "agent_command", "agent_timeout"}
+        before = self.settings()
+        before_vault = Path(before["vault_path"]).expanduser().resolve()
         with self.lock, self.connect() as db:
             for key, value in data.items():
                 if key in allowed and value is not None:
@@ -773,8 +1001,49 @@ class ResearchStore:
                     if key == "workspace_dir" and not str(value).strip(): value = str(DEFAULT_WORKSPACE)
                     db.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (key, str(value), NOW()))
         current = self.settings()
-        Path(current["vault_path"]).expanduser().resolve().mkdir(parents=True, exist_ok=True)
+        current_vault = Path(current["vault_path"]).expanduser().resolve()
+        current_vault.mkdir(parents=True, exist_ok=True)
+        if current_vault != before_vault:
+            self._move_pdf_library(before_vault, current_vault)
         return current
+
+    def _move_pdf_library(self, old_vault: Path, new_vault: Path) -> None:
+        """Move registered PDF originals when the active Vault changes.
+
+        Only paths previously created inside the old Research Companion PDF
+        Library are eligible. Arbitrary files elsewhere are never touched.
+        Missing originals remain referenced at their recorded location so a
+        settings change cannot silently destroy the only known copy.
+        """
+        old_root = (old_vault / PROJECTION_DIR / "PDF Library").resolve()
+        if not old_root.is_dir():
+            return
+        with self.connect() as db:
+            rows = db.execute("SELECT id,stored_path,discipline FROM pdf_documents").fetchall()
+        moved: list[tuple[str, str]] = []
+        for row in rows:
+            source = Path(row["stored_path"]).expanduser().resolve()
+            if source == old_root or old_root not in source.parents or not source.is_file():
+                continue
+            target = copy_into_library(source, new_vault, row["id"], row["discipline"])
+            try:
+                source.unlink()
+            except OSError:
+                if target.is_file():
+                    target.unlink()
+                continue
+            moved.append((str(target), row["id"]))
+        if moved:
+            with self.lock, self.connect() as db:
+                for stored_path, pdf_id in moved:
+                    db.execute("UPDATE pdf_documents SET stored_path=?,updated_at=? WHERE id=?", (stored_path, NOW(), pdf_id))
+        try:
+            for directory in sorted(old_root.rglob("*"), reverse=True):
+                if directory.is_dir():
+                    directory.rmdir()
+            old_root.rmdir()
+        except OSError:
+            pass
 
     def create_conversation(self, data: dict[str, Any] | None = None) -> dict[str, Any]:
         data = data or {}
@@ -796,7 +1065,7 @@ class ResearchStore:
 
     def conversations(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT c.*, (SELECT content FROM chat_messages m WHERE m.conversation_id=c.id ORDER BY m.created_at DESC LIMIT 1) AS last_message FROM conversations c ORDER BY c.updated_at DESC LIMIT ?", (max(1, min(limit, 200)),))]
+            return [dict(row) for row in db.execute("SELECT c.*, (SELECT content FROM chat_messages m WHERE m.conversation_id=c.id ORDER BY m.created_at DESC LIMIT 1) AS last_message FROM conversations c ORDER BY c.updated_at DESC LIMIT ?", (max(1, min(limit, 100000)),))]
 
     def delete_conversation(self, conversation_id: str) -> bool:
         conversation = self.conversation(conversation_id)
@@ -968,11 +1237,48 @@ class ResearchStore:
         except OSError as exc:
             return f"エージェントの起動に失敗しました: {exc}", 1
 
-    def _chat_memory(self, project_id: str | None, user_message: str, assistant_message: str, conversation_id: str) -> dict[str, Any] | None:
+    def _chat_memory(self, project_id: str | None, user_message: str, assistant_message: str, conversation_id: str) -> tuple[str, dict[str, Any] | None]:
+        """Let the agent mark durable knowledge without exposing the protocol to the user."""
+        match = AGENT_MEMORY_BLOCK.search(assistant_message)
+        visible_message = assistant_message
+        agent_memory: dict[str, Any] | None = None
+        if match:
+            visible_message = (assistant_message[:match.start()] + assistant_message[match.end():]).strip()
+            try:
+                parsed = json.loads(match.group(1))
+                if isinstance(parsed, dict) and str(parsed.get("content", "")).strip():
+                    agent_memory = parsed
+            except (json.JSONDecodeError, TypeError):
+                agent_memory = None
+
         explicit = user_message.strip().lower().startswith(("/remember", "/decision", "/failure", "/question", "/evidence", "/finding"))
-        agent_requested = "[[remember]]" in assistant_message.lower()
-        if not explicit and not agent_requested:
-            return None
+        legacy_marker = "[[remember]]" in visible_message.lower()
+        if legacy_marker:
+            visible_message = re.sub(r"\s*\[\[remember\]\]\s*", "\n", visible_message, flags=re.IGNORECASE).strip()
+        if agent_memory:
+            def score(name: str, fallback: float) -> float:
+                try:
+                    return max(0.0, min(1.0, float(agent_memory.get(name, fallback))))
+                except (TypeError, ValueError):
+                    return fallback
+
+            memory = self.create_memory({
+                "project_id": project_id,
+                "type": agent_memory.get("type", "note"),
+                "title": str(agent_memory.get("title") or "Agent insight")[:120],
+                "content": str(agent_memory["content"]).strip(),
+                "source_type": "agent_decided",
+                "source_id": conversation_id,
+                "importance": score("importance", .6),
+                "confidence": score("confidence", .7),
+                "reuse_probability": score("reuse_probability", .6),
+                "rediscovery_cost": score("rediscovery_cost", .6),
+                "metadata": {"capture_mode": "agent_decided", "reason": str(agent_memory.get("reason", ""))[:500]},
+            })
+            return visible_message or "エージェントが重要な知見を保存しました。", memory
+
+        if not explicit and not legacy_marker:
+            return visible_message, None
         first = user_message.strip().splitlines()[0] if user_message.strip() else "Chat insight"
         memory_type = "note"
         for prefix, kind in (("/decision", "decision"), ("/failure", "failure"), ("/question", "question"), ("/evidence", "evidence"), ("/finding", "finding")):
@@ -980,12 +1286,13 @@ class ResearchStore:
                 memory_type = kind; first = user_message.strip()[len(prefix):].strip() or kind.title(); break
         if user_message.strip().lower().startswith("/remember"):
             first = user_message.strip()[9:].strip() or first
-        return self.create_memory({
+        memory = self.create_memory({
             "project_id": project_id, "type": memory_type, "title": first[:120],
-            "content": f"User: {user_message.strip()}\n\nAgent: {assistant_message.strip()}",
+            "content": f"User: {user_message.strip()}\n\nAgent: {visible_message.strip()}",
             "source_type": "chat_message", "source_id": conversation_id,
             "importance": .7 if explicit else .55, "confidence": .65,
         })
+        return visible_message, memory
 
     def _finish_chat(self, conversation_id: str, assistant: str, exit_code: int, workspace: str,
                      command: str, settings: dict[str, str], run_id: str,
@@ -1120,11 +1427,20 @@ class ResearchStore:
         imported = self.import_obsidian(settings["vault_path"], project_id)
         context = self.compile_context(project_id, message, 8)["packet"] if project_id else ""
         history = self.conversation(conversation_id)["messages"][-11:-1]
-        prompt = "You are the user's research/coding agent. Work in the supplied directory. Preserve provenance and do not invent facts.\n\nRESEARCH CONTEXT:\n" + context + "\n\nRECENT CHAT:\n" + "\n".join(f"{m['role']}: {m['content']}" for m in history) + f"\n\nUSER:\n{message}"
+        prompt = "You are the user's research/coding agent. Work in the supplied directory. Preserve provenance and do not invent facts.\n\n" \
+            "After answering, independently judge whether this exchange contains a durable, project-specific insight worth remembering. " \
+            "Do not save greetings, routine progress, temporary suggestions, unverified speculation, or information that is only useful for this turn. " \
+            "If it is worth saving, append exactly one machine-readable block at the very end, after the normal answer, using this format: " \
+            "[[memory]]{\"type\":\"finding\",\"title\":\"short title\",\"content\":\"durable insight\",\"importance\":0.0,\"confidence\":0.0,\"reuse_probability\":0.0,\"rediscovery_cost\":0.0,\"reason\":\"why it will matter later\"}[[/memory]] " \
+            "Use a valid Memory type, numeric scores from 0 to 1, and omit the block when nothing is durable. " \
+            "The application removes this block before showing or storing the visible response.\n\nRESEARCH CONTEXT:\n" + context + "\n\nRECENT CHAT:\n" + "\n".join(f"{m['role']}: {m['content']}" for m in history) + f"\n\nUSER:\n{message}"
         run_id = str(data.get("run_id") or uid("run"))
         assistant, exit_code = self._agent_command_with_id(command, prompt, workspace, timeout, run_id)
         if exit_code != 0: assistant = f"Agent error (exit {exit_code})\n\n{assistant}"
-        memory = self._chat_memory(project_id, message, assistant, conversation_id) if exit_code == 0 else None
+        if exit_code == 0:
+            assistant, memory = self._chat_memory(project_id, message, assistant, conversation_id)
+        else:
+            memory = None
         return self._finish_chat(conversation_id, assistant, exit_code, workspace, command, settings, run_id, memory, imported, bool(context))
 
     def jobs(self) -> list[dict[str, Any]]:
@@ -1184,6 +1500,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
         self.end_headers(); self.wfile.write(body)
+    def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "private, max-age=300")
+        self.end_headers()
+        self.wfile.write(body)
     def _json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0")); return json.loads(self.rfile.read(length) or b"{}")
     def do_OPTIONS(self) -> None:
@@ -1198,6 +1521,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == "/api/settings": return self._send(200, self.store.settings())
             if path == "/api/projects": return self._send(200, self.store.projects())
             if path == "/api/conversations": return self._send(200, self.store.conversations())
+            if path == "/api/pdfs": return self._send(200, self.store.pdfs(q.get("project_id", [None])[0], int(q.get("limit", [1000])[0])))
+            if path.startswith("/api/pdfs/"):
+                parts = path.split("/")
+                pdf_id = parts[3]
+                if len(parts) == 5 and parts[4] == "file":
+                    pdf_path = self.store._pdf_path(pdf_id)
+                    return self._send_bytes(200, pdf_path.read_bytes(), "application/pdf")
+                if len(parts) == 6 and parts[4] == "page":
+                    return self._send_bytes(200, render_page(self.store._pdf_path(pdf_id), int(parts[5])), "image/png")
+                return self._send(200, self.store.pdf(pdf_id) or {"error": "not found"})
             if path.startswith("/api/runs/"):
                 return self._send(200, self.store.run_status(path.rsplit("/", 1)[1]))
             if path.startswith("/api/conversations/"):
@@ -1230,6 +1563,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = self.store.create_project(data)
                 self.store.sync_obsidian(self.store.settings()["vault_path"], result["id"])
                 return self._send(201, result)
+            if path == "/api/pdfs":
+                result = self.store.import_pdf(data)
+                self.store.sync_obsidian(self.store.settings()["vault_path"], data.get("project_id"))
+                return self._send(201, result)
+            if path.startswith("/api/pdfs/") and path.endswith("/summarize"):
+                pdf_id = path.split("/")[3]
+                result = self.store.summarize_pdf(pdf_id)
+                self.store.sync_obsidian(self.store.settings()["vault_path"], result["document"].get("project_id"))
+                return self._send(200, result)
+            if path.startswith("/api/pdfs/") and path.endswith("/translate"):
+                pdf_id = path.split("/")[3]
+                return self._send(200, self.store.translate_pdf_page(pdf_id, int(data.get("page_number", 0))))
             if path == "/api/conversations": return self._send(201, self.store.create_conversation(data))
             if path == "/api/chat": return self._send(200, self.store.chat(data))
             if path == "/api/chat/cancel": return self._send(200, {"cancelled": self.store.cancel_agent(str(data.get("run_id", "")))})
@@ -1247,8 +1592,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = self.store.consolidate(data.get("project_id"))
                 self.store.sync_obsidian(self.store.settings()["vault_path"], data.get("project_id"))
                 return self._send(200, result)
-            if path == "/api/obsidian/sync": return self._send(200, self.store.sync_obsidian(data["vault"], data.get("project_id")))
-            if path == "/api/obsidian/import": return self._send(200, self.store.import_obsidian(data["vault"], data.get("project_id")))
+            if path == "/api/obsidian/sync":
+                vault = str(data.get("vault") or self.store.settings()["vault_path"])
+                return self._send(200, self.store.sync_obsidian(vault, data.get("project_id")))
+            if path == "/api/obsidian/import":
+                vault = str(data.get("vault") or self.store.settings()["vault_path"])
+                return self._send(200, self.store.import_obsidian(vault, data.get("project_id")))
             if path == "/api/jobs/run":
                 result = self.store.run_job(data["name"])
                 self.store.sync_obsidian(self.store.settings()["vault_path"])
@@ -1264,7 +1613,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conversation_id = path.rsplit("/", 1)[1]
                 if not self.store.delete_conversation(conversation_id):
                     return self._send(404, {"error": "conversation not found"})
+                self.store.sync_obsidian(self.store.settings()["vault_path"])
                 return self._send(200, {"deleted": True, "conversation_id": conversation_id})
+            if path.startswith("/api/projects/"):
+                project_id = path.rsplit("/", 1)[1]
+                result = self.store.delete_project(project_id)
+                if not result:
+                    return self._send(404, {"error": "project not found"})
+                self.store.sync_obsidian(self.store.settings()["vault_path"])
+                return self._send(200, {"deleted": True, **result})
+            if path.startswith("/api/pdfs/"):
+                pdf_id = path.rsplit("/", 1)[1]
+                if not self.store.delete_pdf(pdf_id):
+                    return self._send(404, {"error": "PDF not found"})
+                self.store.sync_obsidian(self.store.settings()["vault_path"])
+                return self._send(200, {"deleted": True, "pdf_id": pdf_id})
             if path.startswith("/api/memories/"):
                 memory_id = path.rsplit("/", 1)[1]
                 if not self.store.delete_memory(memory_id):
@@ -1279,7 +1642,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             data = self._json()
-            if path == "/api/settings": return self._send(200, self.store.update_settings(data))
+            if path == "/api/settings":
+                settings = self.store.update_settings(data)
+                self.store.sync_obsidian(settings["vault_path"])
+                return self._send(200, settings)
             if path.startswith("/api/projects/"):
                 result = self.store.update_project(path.rsplit("/", 1)[1], data)
                 if result:

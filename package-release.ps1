@@ -15,7 +15,8 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
 New-Item -ItemType Directory -Force -Path $dist, $stage | Out-Null
 try {
     Copy-Item -LiteralPath $exe -Destination (Join-Path $stage "Research Companion.exe")
-    Copy-Item -LiteralPath (Join-Path $repoRoot "README.md"), (Join-Path $repoRoot "README.en.md"), (Join-Path $repoRoot "README.ja.md") -Destination $stage
+    Copy-Item -LiteralPath (Join-Path $repoRoot "README.md"), (Join-Path $repoRoot "README.en.md"), (Join-Path $repoRoot "README.ja.md"), (Join-Path $repoRoot "THIRD_PARTY_NOTICES.md") -Destination $stage
+    Copy-Item -LiteralPath (Join-Path $repoRoot "licenses") -Destination $stage -Recurse
     if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
     Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $archive -CompressionLevel Optimal
 } finally {

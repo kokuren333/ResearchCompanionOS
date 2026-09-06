@@ -114,6 +114,7 @@ label input:focus { border-color: var(--accent); }
 .manage-toolbar { max-width: 1240px; margin: 0 auto 18px; display: flex; align-items: flex-end; gap: 10px; }
 .manage-toolbar label { margin: 0; min-width: 240px; }
 .manage-toolbar .primary-button { margin-bottom: 0; }
+.manage-toolbar .danger-button { margin-bottom: 0; }
 .manage-grid { max-width: 1240px; margin: 0 auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .card { min-width: 0; background: #292929; border: 1px solid #3b3b3b; border-radius: 12px; padding: 18px; box-shadow: 0 8px 25px #0002; }
 .card h2 { margin: 3px 0 0; font-size: 18px; }
@@ -156,6 +157,30 @@ label textarea:focus { border-color: var(--accent); }
 .graph-edge .node { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d5d5d5; }
 .graph-edge .relation { color: var(--accent); font-size: 10px; }
 .vault-card { grid-column: span 2; }
+.pdf-card { grid-column: span 2; }
+.pdf-import-form { display: grid; grid-template-columns: minmax(180px, 1.2fr) auto minmax(160px, 1fr) auto; gap: 8px; align-items: center; margin-bottom: 15px; }
+.pdf-import-form input[type="file"], .pdf-import-form input:not([type]) { min-width: 0; color: #aaa; background: #303030; border: 1px solid #505050; border-radius: 7px; padding: 9px; font: inherit; }
+.pdf-import-form input[type="file"] { width: 100%; }
+.pdf-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
+.pdf-item { min-width: 0; overflow: hidden; border: 1px solid #424242; border-radius: 9px; background: #222; cursor: pointer; }
+.pdf-item:hover { border-color: #718e5f; background: #282d25; }
+.pdf-thumb { display: block; width: 100%; aspect-ratio: 1.35 / 1; object-fit: cover; background: #171717; }
+.pdf-item-copy { padding: 9px; }
+.pdf-item-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+.pdf-item-meta { margin-top: 3px; color: #929292; font-size: 10px; }
+.pdf-item-summary { margin-top: 6px; color: #bdbdbd; font-size: 11px; height: 34px; overflow: hidden; }
+#pdf-reader-dialog { width: min(1180px, calc(100% - 24px)); max-height: calc(100dvh - 24px); }
+#pdf-reader-form { padding: 20px; max-height: calc(100dvh - 24px); overflow: hidden; display: flex; flex-direction: column; }
+.pdf-reader-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+.pdf-reader-pages { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; padding-right: 4px; }
+.pdf-reader-page { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 12px; border-top: 1px solid #444; padding-top: 12px; }
+.pdf-reader-page img { width: 100%; max-height: 780px; object-fit: contain; background: #111; border-radius: 6px; }
+.pdf-reader-page-copy { min-width: 0; }
+.pdf-reader-page-copy h3 { margin: 0 0 7px; font-size: 12px; color: var(--accent); }
+.pdf-reader-page-copy pre { max-height: 330px; overflow: auto; margin: 0; white-space: pre-wrap; color: #d1d1d1; font: 12px/1.65 ui-sans-serif, system-ui, sans-serif; }
+.pdf-translate-button { margin-top: 9px; }
+.pdf-reader-summary { margin: 0 0 16px; padding: 12px; border-radius: 7px; background: #1b1b1b; color: #ccc; white-space: pre-wrap; max-height: 240px; overflow: auto; }
+@media (max-width: 900px) { .pdf-import-form { grid-template-columns: 1fr 1fr; } .pdf-card { grid-column: span 1; } .pdf-reader-page { grid-template-columns: 1fr; } }
 @media (max-width: 900px) { .manage-grid { grid-template-columns: 1fr; } .vault-card { grid-column: span 1; } }
 @media (max-width: 700px) {
   .sidebar { width: 58px; padding: 12px 7px; }

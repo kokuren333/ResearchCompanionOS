@@ -1,3 +1,4 @@
+import base64
 import tempfile
 import threading
 import time
@@ -6,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app import ResearchStore
+from pypdf import PdfWriter
 
 
 class ResearchCompanionCoreTests(unittest.TestCase):
@@ -101,6 +103,19 @@ class ResearchCompanionCoreTests(unittest.TestCase):
         self.assertFalse(old_file.exists())
         self.assertTrue(any(path.name.startswith(memory["id"] + "-") for path in (vault / "Research Companion" / "Projects" / "test-research" / "Memory" / "note").glob("*.md")))
 
+    def test_vault_sync_preserves_hand_edited_projection(self):
+        vault = Path(self.temp.name) / "edited-vault"
+        memory = self.store.create_memory({"project_id": self.project["id"], "type": "note", "title": "Stable title", "content": "original"})
+        self.store.sync_obsidian(str(vault))
+        generated = next((vault / "Research Companion" / "Projects" / "test-research" / "Memory" / "note").glob(f"{memory['id']}-*.md"))
+        generated.write_text("# My hand-edited note\n", encoding="utf-8")
+        with self.store.connect() as db:
+            db.execute("UPDATE memories SET content=? WHERE id=?", ("new source content", memory["id"]))
+        result = self.store.sync_obsidian(str(vault))
+        self.assertIn(str(generated), result["conflicts"])
+        self.assertEqual(generated.read_text(encoding="utf-8"), "# My hand-edited note\n")
+        self.assertTrue((generated.parent / f"{generated.stem} (Research Companion update).md").exists())
+
     def test_imports_only_tagged_user_note(self):
         vault = Path(self.temp.name) / "import-vault"
         notes = vault / "Literature"
@@ -157,6 +172,21 @@ class ResearchCompanionCoreTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(output, "reply")
 
+    def test_agent_decides_when_to_save_durable_memory(self):
+        vault = Path(self.temp.name) / "agent-memory-vault"
+        marker = '[[memory]]{"type":"finding","title":"Encoding boundary","content":"All imported notes must be UTF-8.","importance":0.92,"confidence":0.88,"reuse_probability":0.9,"rediscovery_cost":0.8,"reason":"Prevents a recurring import failure."}[[/memory]]'
+        encoded = base64.b64encode(f"Durable answer\n{marker}".encode()).decode()
+        command = f'python -c "import sys,base64; print(base64.b64decode(sys.argv[1]).decode())" {encoded}'
+        self.store.update_settings({"vault_path": str(vault), "workspace_dir": self.temp.name, "agent_command": command})
+        result = self.store.chat({"project_id": self.project["id"], "message": "We found a rule that should survive this session."})
+        self.assertEqual(result["message"]["exit_code"], 0)
+        self.assertEqual(result["memory"]["source_type"], "agent_decided")
+        self.assertEqual(result["memory"]["type"], "finding")
+        self.assertAlmostEqual(result["memory"]["importance"], 0.92)
+        self.assertNotIn("[[memory]]", result["message"]["content"])
+        conversation = self.store.conversation(result["conversation_id"])
+        self.assertNotIn("[[memory]]", conversation["messages"][-1]["content"])
+
     def test_legacy_success_message_stderr_is_migrated_away(self):
         conversation = self.store.create_conversation({"project_id": self.project["id"], "title": "legacy"})
         with self.store.connect() as db:
@@ -202,6 +232,47 @@ class ResearchCompanionCoreTests(unittest.TestCase):
         self.assertEqual(updated["state"], "HOT")
         self.assertTrue(self.store.delete_memory(memory["id"]))
         self.assertIsNone(self.store.memory(memory["id"]))
+
+    def test_project_delete_removes_children_and_keeps_last_project(self):
+        other = self.store.create_project({"name": "Temporary"})
+        self.store.create_memory({"project_id": other["id"], "type": "note", "title": "child", "content": "remove"})
+        conversation = self.store.create_conversation({"project_id": other["id"], "title": "child chat"})
+        result = self.store.delete_project(other["id"])
+        self.assertEqual(result["memories"], 1)
+        self.assertEqual(result["conversations"], 1)
+        self.assertIsNone(self.store.project(other["id"]))
+        self.assertIsNone(self.store.conversation(conversation["id"]))
+        self.assertIsNotNone(self.store.delete_project(self.project["id"]))
+        remaining = self.store.projects()[0]
+        with self.assertRaises(ValueError):
+            self.store.delete_project(remaining["id"])
+
+    def test_pdf_library_extracts_renders_and_deduplicates(self):
+        source = Path(self.temp.name) / "paper.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+        vault = Path(self.temp.name) / "paper-vault"
+        self.store.update_settings({"vault_path": str(vault)})
+        imported = self.store.import_pdf({"project_id": self.project["id"], "path": str(source), "discipline": "Test field", "ocr": False})
+        self.assertFalse(imported["duplicate"])
+        document = imported["document"]
+        self.assertEqual(document["page_count"], 1)
+        self.assertTrue(Path(document["stored_path"]).exists())
+        self.assertEqual(len(self.store.pdfs(self.project["id"])), 1)
+        self.assertGreater(len(__import__("pdf_library").render_page(Path(document["stored_path"]), 1)), 100)
+        duplicate = self.store.import_pdf({"project_id": self.project["id"], "path": str(source), "ocr": False})
+        self.assertTrue(duplicate["duplicate"])
+        old_path = Path(document["stored_path"])
+        new_vault = Path(self.temp.name) / "migrated-paper-vault"
+        self.store.update_settings({"vault_path": str(new_vault)})
+        migrated = self.store.pdf(document["id"])
+        self.assertNotEqual(migrated["stored_path"], str(old_path))
+        self.assertTrue(Path(migrated["stored_path"]).exists())
+        self.assertFalse(old_path.exists())
+        self.assertTrue(self.store.delete_pdf(document["id"]))
+        self.assertFalse(Path(migrated["stored_path"]).exists())
 
 
 if __name__ == "__main__":

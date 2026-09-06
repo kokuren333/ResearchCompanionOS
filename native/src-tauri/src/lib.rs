@@ -115,6 +115,15 @@ fn pick_directory() -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+#[tauri::command]
+fn pick_pdf() -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title("Choose a research PDF")
+        .add_filter("PDF documents", &["pdf"])
+        .pick_file()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 fn kill_backend(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<BackendProcess>() {
         if let Ok(mut process) = state.0.lock() {
@@ -135,7 +144,7 @@ pub fn run() {
             app.manage(BackendPort(Mutex::new(port)));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_backend_port, pick_directory])
+        .invoke_handler(tauri::generate_handler![get_backend_port, pick_directory, pick_pdf])
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")
         .run(|app, event| {

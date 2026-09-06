@@ -2,7 +2,7 @@
 
 [English](README.en.md) · [プロジェクト概要](README.md)
 
-Research Companion OSは、長期研究をローカルで継続するための研究伴走アプリです。普段はChatGPTのようなチャットUIだけを使い、重要な知見をSQLiteへ構造化して保存します。保存した知識は検索やAgent Context Packetに使われ、Obsidianにはプロジェクト・Memory・会話を相互に辿れる形で出力されます。
+Research Companion OSは、長期研究をローカルで継続するための研究伴走アプリです。普段はChatGPTのようなチャットUIだけを使い、重要な知見をSQLiteへ構造化して保存します。保存した知識は検索やAgent Context Packetに使われ、Obsidianにはプロジェクト・Memory・会話を相互に辿れる形で出力されます。研究PDFは分野別にVaultへ保存し、原文ページとCPU OCR/エージェント翻訳を並べて読めます。
 
 ## 目的と考え方
 
@@ -21,7 +21,7 @@ SQLiteが機械側の正本です。Obsidianは人間が読むための投影で
 
 ZIPを展開して `Research Companion.exe` を起動してください。PythonバックエンドはTauriアプリに同梱されているため、配布版の実行にPythonは不要です。バックエンドは動的に割り当てたlocalhostポートだけで待ち受け、Windows版は黒いコマンドプロンプトを開きません。
 
-ZIPには実行ファイルとドキュメントだけを含めます。ユーザーのVault、データベース、認証情報、開発用チェックアウトは含めません。
+ZIPには実行ファイルとドキュメント、第三者ライセンス通知だけを含めます。ユーザーのVault、データベース、認証情報、開発用チェックアウトは含めません。
 
 ### ソースから開発版を起動する
 
@@ -47,7 +47,7 @@ python app.py
 .\package-release.ps1
 ```
 
-Tauriのexeとインストーラーは `native/src-tauri/target/release/` に生成され、配布ZIPは `dist/` に生成されます。`package-release.ps1` がZIPへ入れるのはリリース用exeと3つのREADMEだけです。`dist/` とビルド生成物はGitで無視されます。
+Tauriのexeとインストーラーは `native/src-tauri/target/release/` に生成され、配布ZIPは `dist/` に生成されます。`package-release.ps1` がZIPへ入れるのはリリース用exe、ドキュメント、第三者ライセンス通知だけです。`dist/` とビルド生成物はGitで無視されます。
 
 ## 基本的な使い方
 
@@ -59,13 +59,19 @@ Tauriのexeとインストーラーは `native/src-tauri/target/release/` に生
 
 ### 2. 残すべき知見を保存する
 
-決定的に保存したい場合はスラッシュコマンドを使います。Research StateやMemoryを画面で編集したい場合は、チャットとは別の`Research OS`管理画面を使います。ローカルコマンドは外部エージェントを起動しません。
+通常の会話でも、回答後に設定済みエージェントが「このプロジェクトにとって長期的に残す価値があるか」を判断します。Decision、Finding、Failure、Evidence、Procedureなどに当たる durable な知見だけを、内部の構造化ブロックで自動保存します。挨拶、通常の進捗、一時的な提案、未検証の推測は保存しません。内部ブロックは回答を表示する前に取り除かれます。特定の内容を必ず保存したい場合はスラッシュコマンドを使い、Research StateやMemoryを画面で編集したい場合はチャットとは別の`Research OS`管理画面を使います。ローカルコマンドは外部エージェントを起動しません。
 
 `タイトル | 本文` の形式では、最初の `|` より前がタイトル、後ろが本文になります。`|` がなければ先頭120文字がタイトルになります。
 
 ### 3. Research OS管理画面を使う
 
-チャットと分離した管理画面には、プロジェクト選択・作成、Research State編集、Memoryの作成・編集・削除・絞り込み、検索、状態別件数、Context Packet確認・コピー、グラフ確認、Maintenance、Obsidian同期、タグ付きノート取り込みがあります。
+チャットと分離した管理画面には、プロジェクト選択・作成・完全削除、Research State編集、Memoryの作成・編集・削除・絞り込み、検索、状態別件数、Context Packet確認・コピー、グラフ確認、Maintenance、Obsidian同期、タグ付きノート取り込み、PDF Libraryがあります。
+
+### PDF Library
+
+管理画面のPDF LibraryでPDFを選び、研究分野を入力して追加します。PDFは現在のVaultの`Research Companion/PDF Library/<分野>/`へ保存され、同じSHA-256のPDFは同一プロジェクトへ重複登録しません。文字を持つPDFは抽出テキストを使い、画像PDFはRapidOCRの小型ONNX Runtime CPUモデルでOCRを試みます。GPUは必要ありません。
+
+カードを開くと、ページ画像を左、原文または翻訳を右に表示します。翻訳と要約は設定済みのローカルエージェントへ渡され、要約はFinding MemoryとObsidianのPaperノートにも保存されます。これは原PDFを再組版しないため、図・表・段組みを壊さずに読むための設計です。このリリースはレイアウトを維持するReaderであり、翻訳済みPDFを新しく組版して書き出す機能はまだありません。画像PDFのOCR品質は文書・CPU性能に依存し、抽出できないページは原文のまま表示されます。
 
 ### 4. Obsidianで読む
 
@@ -80,10 +86,11 @@ VaultをObsidianで開き、最初に `Research Companion/Home.md` を開いて�
    ├─ Projects/<project>/Project State.md       # 互換リンク
    ├─ Projects/<project>/Memory Index.md
    ├─ Projects/<project>/Memory/<type>/*.md
-   └─ Conversations/*.md
+   ├─ Conversations/*.md
+   └─ Projects/<project>/Papers/<discipline>/*.md
 ```
 
-Homeからプロジェクトへ移動できます。Project OverviewからMemory Indexと会話へ移動でき、Memoryからプロジェクト、関連Memory、元会話へ戻れます。同期時、ユーザーが編集した古い生成ファイルは勝手に削除しません。
+Homeからプロジェクトへ移動できます。Project OverviewからMemory Indexと会話へ移動でき、Memoryからプロジェクト、関連Memory、元会話へ戻れます。同期時、ユーザーが編集した生成ファイルは上書きせず、隣に`Research Companion update`ファイルを作ります。
 
 ## スラッシュコマンド
 
@@ -158,7 +165,7 @@ Invoke-RestMethod http://127.0.0.1:8765/api/context/compile -Method Post `
 
 ## 開発・テスト
 
-バックエンドはPython標準ライブラリだけで動作します。
+バックエンドの基本機能はPython標準ライブラリで動作します。PDF機能には`requirements.txt`のpypdf、pypdfium2、RapidOCR、ONNX Runtime CPUが必要です。ビルドスクリプトが自動インストールし、PyInstallerでバックエンドへ同梱します。
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -167,7 +174,7 @@ python -m py_compile app.py
 git diff --check
 ```
 
-ネイティブビルドではPyInstallerでバックエンドをまとめ、Tauriでデスクトップシェルを作ります。`native/node_modules`、PyInstaller作業ファイル、Tauriのtarget、DB、キャッシュ、Vault内容、リリースZIPは無視対象で、コミットしてはいけません。
+ネイティブビルドではPyInstallerでバックエンドをまとめ、Tauriでデスクトップシェルを作ります。`native/node_modules`、PyInstaller作業ファイル、Tauriのtarget、DB、キャッシュ、Vault内容、リリースZIPは無視対象で、コミットしてはいけません。第三者コンポーネントの扱いは`THIRD_PARTY_NOTICES.md`を確認してください。
 
 ## 安全性と設計上の境界
 
@@ -176,7 +183,7 @@ git diff --check
 - APIキー、DB、会話ログ、生成Vault、個人パスはGitへ入れません。
 - ローカル埋め込みは依存関係なしの決定的な代替実装であり、大規模モデルと同等の意味理解を保証しません。
 - Maintenanceは初期状態では明示実行です。オプションのスケジューラーも研究上の事実を生成しません。
-- Obsidianは正本ではありません。生成ページを直接編集すると後の同期で上書きされる場合があるため、ユーザーノートは生成フォルダの外に置いて明示的に取り込んでください。
+- Obsidianは正本ではありません。生成ページを直接編集しても保持され、後の同期では隣に更新案が作られます。ユーザーノートは生成フォルダの外に置いて明示的に取り込んでください。
 
 ## 現在の制限
 

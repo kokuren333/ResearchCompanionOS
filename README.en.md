@@ -2,7 +2,7 @@
 
 [日本語版 / Japanese](README.ja.md) · [Project overview](README.md)
 
-Research Companion OS is a local-first research continuity tool. Its normal interface is a ChatGPT-style chat. The app keeps durable research state and structured memories in SQLite, compiles a small context packet for an agent, and projects the resulting knowledge into a navigable Obsidian vault.
+Research Companion OS is a local-first research continuity tool. Its normal interface is a ChatGPT-style chat. The app keeps durable research state and structured memories in SQLite, compiles a small context packet for an agent, and projects the resulting knowledge into a navigable Obsidian vault. Research PDFs can be stored by discipline and read with the original page beside CPU-OCR/agent translation text.
 
 ## Why it exists
 
@@ -21,7 +21,7 @@ SQLite is the source of truth. Obsidian is a readable projection and an optional
 
 Unzip the release and launch `Research Companion.exe`. The Python backend is bundled inside the Tauri application, so Python is not required to run the packaged app. The backend listens only on a dynamically allocated localhost port and the Windows build does not open a console window.
 
-The ZIP is intentionally limited to the executable and documentation. It does not contain a user Vault, database, credentials, or development checkout.
+The ZIP is intentionally limited to the executable, documentation, and third-party notices. It does not contain a user Vault, database, credentials, or development checkout.
 
 ### Run from source
 
@@ -47,7 +47,7 @@ From the repository root:
 .\package-release.ps1
 ```
 
-Tauri installers and the executable are written under `native/src-tauri/target/release/`. The packaging script creates a ZIP under `dist/` and includes only the release executable and the three README files. `dist/` and all build outputs are ignored by Git.
+Tauri installers and the executable are written under `native/src-tauri/target/release/`. The packaging script creates a ZIP under `dist/` and includes only the release executable, documentation, and third-party license notices. `dist/` and all build outputs are ignored by Git.
 
 ## The normal workflow
 
@@ -59,13 +59,19 @@ The app saves the conversation locally. Successful agent diagnostics such as the
 
 ### 2. Capture durable knowledge
 
-Use a slash command for deterministic local capture, or use the separate `Research OS` management view to edit Research State and Memory records. Local commands do not start an external agent.
+Normal chat is also eligible for automatic knowledge capture. After answering, the configured agent judges whether the exchange contains a durable project-specific insight. It silently emits a structured capture block only for useful decisions, findings, failures, evidence, procedures, or similar knowledge; greetings, routine progress, temporary suggestions, and unverified speculation are not saved as Memory. The protocol is removed before the answer is shown. Use a slash command when you want to force a specific capture, or use the separate `Research OS` management view to edit Research State and Memory records. Local commands do not start an external agent.
 
 When a command accepts `Title | content`, the part before the first `|` becomes the title and the rest becomes the content. Without `|`, the first 120 characters are used as the title.
 
 ### 3. Review in Research OS
 
-`Research OS` is deliberately separate from Chat. It contains project selection and creation, Research State editing, Memory CRUD and filtering, hybrid search, state counts, Context Packet preview/copy, graph inspection, maintenance, Obsidian sync, and tagged-note import.
+`Research OS` is deliberately separate from Chat. It contains project selection, creation and permanent deletion, Research State editing, Memory CRUD and filtering, hybrid search, state counts, Context Packet preview/copy, graph inspection, maintenance, Obsidian sync, tagged-note import, and a PDF Library.
+
+### PDF Library
+
+Use the PDF Library card to select a PDF and enter a research discipline. The original is stored under the active Vault at `Research Companion/PDF Library/<discipline>/`; an SHA-256 duplicate is not registered twice in the same project. Text PDFs use extracted text. Image-only pages are sent through RapidOCR's small ONNX Runtime CPU model when available, so an NVIDIA GPU is not required.
+
+Open a paper card to read page images on the left and source/translated text on the right. Translation and summarisation use the configured local agent; a summary is also saved as a Finding Memory and a Paper note in Obsidian. The original page is never reflowed, which keeps figures, tables, columns, and margins intact. This release is a layout-preserving reader; it does not export a newly typeset translated PDF. OCR quality for scanned documents depends on the source and CPU.
 
 ### 4. Browse the Obsidian projection
 
@@ -82,10 +88,11 @@ Typical structure:
    ├─ Projects/<project>/Project State.md       # compatibility link
    ├─ Projects/<project>/Memory Index.md
    ├─ Projects/<project>/Memory/<type>/*.md
-   └─ Conversations/*.md
+   ├─ Conversations/*.md
+   └─ Projects/<project>/Papers/<discipline>/*.md
 ```
 
-Home links to projects. A project overview links to its Memory Index and conversations. Memory pages link to their project, related memories, and source conversation. A full sync preserves generated files that a user has edited instead of silently deleting them.
+Home links to projects. A project overview links to its Memory Index and conversations. Memory pages link to their project, related memories, and source conversation. A full sync preserves generated files that a user has edited and writes a separate `Research Companion update` file instead of silently overwriting them.
 
 ## Slash commands
 
@@ -141,11 +148,11 @@ The default path is calculated at runtime from the operating system's per-user a
 - Packaged Tauri app: uses its per-user application-data directory for the database, workspace, and default Vault.
 - Custom locations: set `Vault path` and `Agent working directory` in Settings, or use `--db` for the browser-compatible server.
 
-The application database is authoritative. Vault Markdown files are generated projections marked with a generated-file comment and tracked by `.research-companion-manifest.json`. User-authored notes are imported only when they carry the supported `research-companion` frontmatter/tag conventions.
+The application database is authoritative. Vault Markdown files are generated projections marked with a generated-file comment and tracked by `.research-companion-manifest.json`. User-authored notes are imported only when they carry the supported `research-companion` frontmatter/tag conventions. PDF originals are user research assets under the Vault's PDF Library and are not generated Markdown projections.
 
 ## Local API
 
-Start `python app.py` and open `http://127.0.0.1:8765`. Mutating requests require `X-Research-Companion: desktop`; this prevents an unrelated local web page from invoking the agent runner through CSRF.
+Start `python app.py` and open `http://127.0.0.1:8765`. Core features use the Python standard library; the PDF feature requires the packages in `requirements.txt`. Mutating requests require `X-Research-Companion: desktop`; this prevents an unrelated local web page from invoking the agent runner through CSRF.
 
 ```powershell
 $headers = @{'X-Research-Companion'='desktop'}
@@ -160,7 +167,7 @@ Invoke-RestMethod http://127.0.0.1:8765/api/context/compile -Method Post `
 
 ## Development and tests
 
-The backend intentionally uses only the Python standard library. Run:
+The core backend uses the Python standard library; the PDF reader adds the pinned packages in `requirements.txt`. Run:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -178,7 +185,7 @@ The native build uses PyInstaller for the backend and Tauri for the desktop shel
 - No API key, database, chat transcript, generated Vault, or personal path belongs in Git.
 - The deterministic local embedding is a zero-dependency fallback, not a claim of parity with a large semantic model.
 - Maintenance is explicit by default; the optional scheduler does not invent research facts.
-- Obsidian is not the source of truth. Editing generated pages directly may be overwritten when the source record changes; put durable user-authored notes outside generated folders and import them explicitly.
+- Obsidian is not the source of truth. Editing generated pages directly is preserved; a later sync writes a separate update file. Put durable user-authored notes outside generated folders and import them explicitly.
 
 ## Current limitations
 
